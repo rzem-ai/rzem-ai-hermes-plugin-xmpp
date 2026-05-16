@@ -331,7 +331,11 @@ class XmppAdapter(BasePlatformAdapter):
         url: str | None = None
         try:
             upload = client["xep_0363"]
-            url = await upload.upload_file(path, domain=self.cfg.domain)
+            # Let slixmpp's XEP-0363 plugin discover the upload service via
+            # disco — jabberd2 and most servers run it on a separate
+            # component (e.g. ``upload.example.com``), not the user's own
+            # domain, so hard-coding ``domain=self.cfg.domain`` would miss it.
+            url = await upload.upload_file(path)
         except Exception as exc:
             log.warning("XMPP plugin: HTTP upload failed (%s); sending caption only", exc)
 

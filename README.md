@@ -125,13 +125,27 @@ pull on next start.
 
 ## Local testing
 
-A Prosody container is enough to exercise everything:
+This plugin is developed against **jabberd** (jabberd2). A throwaway
+container is enough to exercise everything end-to-end:
 
 ```bash
-docker run --rm -it -p 5222:5222 --name prosody prosody/prosody
-docker exec -it prosody prosodyctl register hermes localhost hermespw
-docker exec -it prosody prosodyctl register me localhost mepw
+docker run --rm -d -p 5222:5222 -p 5269:5269 --name jabberd jabberd/jabberd2
 ```
+
+Create the two test accounts. The exact path depends on whether your
+jabberd image is using SQLite, MySQL, or PostgreSQL storage; for the
+default SQLite build:
+
+```bash
+docker exec -it jabberd jabberd2-adduser hermes localhost hermespw
+docker exec -it jabberd jabberd2-adduser me      localhost mepw
+```
+
+If your build doesn't ship `jabberd2-adduser`, enable in-band
+registration (XEP-0077) in `c2s.xml` and register from any XMPP
+client, or insert rows directly into the `authreg` table. Either
+route is fine — the plugin only cares that the JIDs exist and accept
+auth.
 
 Point Hermes at it:
 
