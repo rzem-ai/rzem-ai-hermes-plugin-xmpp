@@ -1,0 +1,68 @@
+name: xmpp-platform
+label: XMPP
+kind: platform
+version: 0.1.0
+description: >
+  XMPP gateway adapter for Hermes Agent.
+  Connects to an XMPP server and relays messages between an XMPP
+  account (1:1 chats and MUC rooms) and the Hermes agent.
+  Supports Message Carbons (XEP-0280) so the agent stays in sync
+  with the user's other clients, and Message Archive Management
+  (XEP-0313) so messages received while the gateway was offline
+  are picked up on the next start.
+author: Nous Research community
+entry_point: hermes_plugin_xmpp.adapter:register
+requires_env:
+  - name: XMPP_JID
+    description: "Bot Jabber ID (e.g. hermes@example.com)"
+    prompt: "Bot JID"
+    password: false
+  - name: XMPP_PASSWORD
+    description: "Bot account password"
+    prompt: "Bot password"
+    password: true
+optional_env:
+  - name: XMPP_SERVER
+    description: "XMPP server hostname (defaults to the JID domain)"
+    prompt: "Server hostname (or empty)"
+    password: false
+  - name: XMPP_PORT
+    description: "XMPP server port (default: 5222)"
+    prompt: "Server port"
+    password: false
+  - name: XMPP_USE_TLS
+    description: "Require STARTTLS (1/true/yes to enable, default: true)"
+    prompt: "Require TLS? (true/false)"
+    password: false
+  - name: XMPP_RESOURCE
+    description: "Client resource name (default: hermes)"
+    prompt: "Resource"
+    password: false
+  - name: XMPP_MUC_ROOMS
+    description: "Comma-separated MUC room JIDs to join (e.g. team@conference.example.com)"
+    prompt: "MUC rooms (comma-separated)"
+    password: false
+  - name: XMPP_MUC_NICKNAME
+    description: "Nickname used in MUC rooms (default: hermes-bot)"
+    prompt: "MUC nickname"
+    password: false
+  - name: XMPP_ALLOWED_JIDS
+    description: "Comma-separated bare JIDs allowed to talk to the bot"
+    prompt: "Allowed JIDs (comma-separated)"
+    password: false
+  - name: XMPP_ALLOW_ALL_USERS
+    description: "Allow anyone to talk to the bot (dev only, default: false)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: XMPP_HOME_JID
+    description: "JID for cron / notification delivery (defaults to first allowed JID)"
+    prompt: "Home JID (or empty)"
+    password: false
+  - name: XMPP_MAM_REPLAY_GRACE_SECONDS
+    description: "MAM stanzas newer than this many seconds get a live reply; older ones are ingested silently (default: 300)"
+    prompt: "MAM replay grace (seconds)"
+    password: false
+  - name: XMPP_MAM_CATCHUP_LIMIT
+    description: "Hard cap on stanzas replayed per MAM catch-up (default: 200)"
+    prompt: "MAM catch-up limit"
+    password: false
