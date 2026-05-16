@@ -32,12 +32,36 @@ MUC group rooms.
 
 ## Install
 
-### As a drop-in plugin
+### As a drop-in plugin (recommended)
+
+```bash
+hermes plugins install https://github.com/rzem-ai/hermes-plugin-xmpp.git --no-enable
+```
+
+That clones into `$HERMES_HOME/plugins/xmpp-platform/` and prompts for the
+required env vars. Equivalent manual install:
 
 ```bash
 git clone https://github.com/rzem-ai/hermes-plugin-xmpp.git \
-    ~/.hermes/plugins/xmpp
-pip install slixmpp PyYAML aiohttp
+    "$HERMES_HOME/plugins/xmpp-platform"
+```
+
+Then install the package + its native deps (`slixmpp`, `aiohttp`) into the
+Hermes venv so the inner `hermes_plugin_xmpp` module is importable:
+
+```bash
+uv pip install --python <hermes-venv>/bin/python -e \
+  "$HERMES_HOME/plugins/xmpp-platform"
+```
+
+For a default `scripts/install.sh` install the venv is
+`~/.hermes/bin/venv`. On a split install (`--dir <install-dir>
+--hermes-home <data-dir>`) it lives at `<install-dir>/venv`.
+
+Finally enable it:
+
+```bash
+hermes plugins enable xmpp-platform
 ```
 
 ### As a pip package
@@ -46,8 +70,33 @@ pip install slixmpp PyYAML aiohttp
 pip install hermes-plugin-xmpp
 ```
 
-When installed via pip, the `hermes.platforms` entry point makes the
-plugin discoverable automatically — no copying required.
+`pip install` alone is not sufficient for a Hermes-internal install —
+Hermes discovers platform plugins from `$HERMES_HOME/plugins/<dir>/`
+via its dir scanner, not via the `hermes.platforms` entry-point group
+(which is currently informational). Use the drop-in path above unless
+you're embedding `hermes_plugin_xmpp` as a library in some other host
+that does consume the `hermes.platforms` group.
+
+## Discovery contract
+
+Hermes's directory scanner (`hermes_cli/plugins.py:_load_directory_module`)
+imports `$HERMES_HOME/plugins/xmpp-platform/__init__.py` as
+`hermes_plugins.xmpp_platform` and calls its top-level `register(ctx)`.
+The `ctx` is a `PluginContext` whose `register_platform(...)` method
+takes named keyword args and wires an entry into
+`gateway.platform_registry`.
+
+This repo's top-level `__init__.py` is a thin shim: it calls the inner
+`hermes_plugin_xmpp.adapter.register()` (which returns a descriptor
+dict for forward-compat with other plugin hosts), translates the dict
+into `register_platform()` kwargs, and adds the Hermes-side metadata
+(`required_env`, `allowed_users_env`, `allow_all_env`,
+`cron_deliver_env_var`, `install_hint`, `emoji`) that the inner
+descriptor doesn't surface.
+
+If you're embedding the adapter in a non-Hermes host, you can keep
+calling `hermes_plugin_xmpp.adapter.register()` directly and consume
+the dict yourself.
 
 ## Configure
 
