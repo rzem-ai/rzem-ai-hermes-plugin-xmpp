@@ -332,9 +332,10 @@ class XmppAdapter(BasePlatformAdapter):
         try:
             upload = client["xep_0363"]
             # Let slixmpp's XEP-0363 plugin discover the upload service via
-            # disco — jabberd2 and most servers run it on a separate
-            # component (e.g. ``upload.example.com``), not the user's own
-            # domain, so hard-coding ``domain=self.cfg.domain`` would miss it.
+            # disco — ejabberd's ``mod_http_upload`` lives on its own
+            # component subdomain (e.g. ``upload.chat.rzem.ai``), not the
+            # user's own domain, so hard-coding ``domain=self.cfg.domain``
+            # would miss it.
             url = await upload.upload_file(path)
         except Exception as exc:
             log.warning("XMPP plugin: HTTP upload failed (%s); sending caption only", exc)
@@ -716,7 +717,7 @@ def _interactive_setup() -> dict[str, str]:
             return getpass.getpass(f"{prompt}: ").strip() or default
         return input(f"{prompt}{suffix}: ").strip() or default
 
-    jid = ask("Bot JID (e.g. hermes@example.com)")
+    jid = ask("Bot JID (e.g. hermes@chat.rzem.ai)")
     password = ask("Bot password", secret=True)
     server = ask("Server hostname (blank = derive from JID)")
     port = ask("Server port", default="5222")

@@ -14,7 +14,7 @@ author: Nous Research community
 entry_point: hermes_plugin_xmpp.adapter:register
 requires_env:
   - name: XMPP_JID
-    description: "Bot Jabber ID (e.g. hermes@example.com)"
+    description: "Bot Jabber ID (e.g. hermes@chat.rzem.ai)"
     prompt: "Bot JID"
     password: false
   - name: XMPP_PASSWORD
@@ -39,7 +39,7 @@ optional_env:
     prompt: "Resource"
     password: false
   - name: XMPP_MUC_ROOMS
-    description: "Comma-separated MUC room JIDs to join (e.g. team@conference.example.com)"
+    description: "Comma-separated MUC room JIDs to join (e.g. team@conference.chat.rzem.ai)"
     prompt: "MUC rooms (comma-separated)"
     password: false
   - name: XMPP_MUC_NICKNAME

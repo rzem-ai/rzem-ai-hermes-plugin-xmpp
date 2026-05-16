@@ -61,10 +61,10 @@ hermes gateway setup
 Or set the env vars yourself in `~/.hermes/.env`:
 
 ```
-XMPP_JID=hermes@example.com
+XMPP_JID=hermes@chat.rzem.ai
 XMPP_PASSWORD=replace-me
-XMPP_ALLOWED_JIDS=me@example.com,other@example.com
-XMPP_MUC_ROOMS=team@conference.example.com
+XMPP_ALLOWED_JIDS=me@chat.rzem.ai,other@chat.rzem.ai
+XMPP_MUC_ROOMS=team@conference.chat.rzem.ai
 XMPP_MUC_NICKNAME=hermes-bot
 ```
 
@@ -75,12 +75,12 @@ gateway:
   platforms:
     xmpp:
       extra:
-        jid: hermes@example.com
+        jid: hermes@chat.rzem.ai
         password: replace-me
         allowed_jids:
-          - me@example.com
+          - me@chat.rzem.ai
         muc_rooms:
-          - team@conference.example.com
+          - team@conference.chat.rzem.ai
         muc_nickname: hermes-bot
 ```
 
@@ -123,41 +123,48 @@ The MAM catch-up cursor is persisted at
 (`dm` or `muc:<room_jid>`). Delete the file to force a full archive
 pull on next start.
 
-## Local testing
+## Server: ejabberd on `chat.rzem.ai`
 
-This plugin is developed against **jabberd** (jabberd2). A throwaway
-container is enough to exercise everything end-to-end:
+This plugin is developed against the **ejabberd** instance at
+`chat.rzem.ai`. Any reasonably modern ejabberd (≥ 21.x) will do —
+the plugin only needs:
+
+- standard c2s on TCP 5222 with STARTTLS,
+- `mod_mam` enabled for the user account (Message Archive Management),
+- `mod_carboncopy` enabled (Message Carbons),
+- `mod_muc` for any MUC rooms you want the bot to join,
+- `mod_http_upload` (advertised on its own service JID, typically
+  `upload.chat.rzem.ai`) if you want image / file delivery.
+
+All of these are on by default in stock ejabberd builds.
+
+### Provisioning the bot account
+
+On the ejabberd host (or anywhere `ejabberdctl` is on `$PATH`):
 
 ```bash
-docker run --rm -d -p 5222:5222 -p 5269:5269 --name jabberd jabberd/jabberd2
+ejabberdctl register hermes chat.rzem.ai 'replace-me'
+ejabberdctl register me     chat.rzem.ai 'mepw'
 ```
 
-Create the two test accounts. The exact path depends on whether your
-jabberd image is using SQLite, MySQL, or PostgreSQL storage; for the
-default SQLite build:
+If you prefer the web admin, the equivalent lives at
+`https://chat.rzem.ai/admin/server/chat.rzem.ai/users/`.
 
-```bash
-docker exec -it jabberd jabberd2-adduser hermes localhost hermespw
-docker exec -it jabberd jabberd2-adduser me      localhost mepw
-```
-
-If your build doesn't ship `jabberd2-adduser`, enable in-band
-registration (XEP-0077) in `c2s.xml` and register from any XMPP
-client, or insert rows directly into the `authreg` table. Either
-route is fine — the plugin only cares that the JIDs exist and accept
-auth.
-
-Point Hermes at it:
+### Pointing Hermes at it
 
 ```
-XMPP_JID=hermes@localhost
-XMPP_PASSWORD=hermespw
-XMPP_SERVER=localhost
-XMPP_ALLOWED_JIDS=me@localhost
+XMPP_JID=hermes@chat.rzem.ai
+XMPP_PASSWORD=replace-me
+XMPP_SERVER=chat.rzem.ai
+XMPP_ALLOWED_JIDS=me@chat.rzem.ai
 ```
 
-Run `hermes gateway`, then DM `hermes@localhost` from a Gajim / Dino
-session logged in as `me@localhost`.
+`XMPP_SERVER` is optional — slixmpp will resolve `_xmpp-client._tcp`
+SRV records under `chat.rzem.ai` and find the host automatically.
+Set it only if you need to bypass DNS.
+
+Run `hermes gateway`, then DM `hermes@chat.rzem.ai` from a Gajim /
+Dino / Conversations session logged in as `me@chat.rzem.ai`.
 
 ## Not yet supported
 
