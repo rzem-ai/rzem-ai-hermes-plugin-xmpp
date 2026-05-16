@@ -162,15 +162,25 @@ _BACKOFF_SCHEDULE = (2, 4, 8, 16, 32)
 class XmppAdapter(BasePlatformAdapter):
     """Hermes gateway adapter for XMPP."""
 
-    def __init__(self, cfg: XmppConfig) -> None:
-        super().__init__()
-        self.cfg = cfg
+    def __init__(self, config: Any, **kwargs: Any) -> None:
+        """``config`` is the Hermes ``PlatformConfig`` for the ``xmpp`` slot.
+
+        ``XmppConfig`` is rebuilt from ``config.extra`` (merged with env
+        vars by :func:`load_config`), so the adapter stays usable as
+        long as either the env or the YAML extras carry ``XMPP_JID`` /
+        ``XMPP_PASSWORD``.
+        """
+        from gateway.config import Platform  # lazy: not needed in tests
+
+        super().__init__(config=config, platform=Platform("xmpp"))
+        extra = getattr(config, "extra", None) or {}
+        self.cfg = load_config(extra)
         self._client: Any | None = None
         self._connected_event: asyncio.Event = asyncio.Event()
         self._stopping: bool = False
         self._reconnect_task: asyncio.Task[None] | None = None
         self._dedup = DedupLRU()
-        self._last_seen = LastSeenStore(cfg.bare_jid)
+        self._last_seen = LastSeenStore(self.cfg.bare_jid)
         self._typing_chats: set[str] = set()
 
     # -- BasePlatformAdapter API ---------------------------------------------
@@ -213,7 +223,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         host = self.cfg.server_or_domain()
         try:
-            client.connect(address=(host, self.cfg.port) if host else None, use_ssl=False)
+            client.connect(host=host or None, port=self.cfg.port)
         except Exception as exc:
             log.error("XMPP plugin: connect() failed: %s", exc)
             return False
@@ -284,6 +294,26 @@ class XmppAdapter(BasePlatformAdapter):
         return SendResult(ok=True, message_ids=message_ids)
 
     # -- Optional capabilities -----------------------------------------------
+
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        """Return a minimal chat descriptor for ``chat_id``.
+
+        XMPP carries no central directory of chat names, so this is a
+        structural classification based on the JID alone: a bare JID
+        whose local part looks like a MUC room (``_looks_like_muc``)
+        is reported as ``type='group'`` with the room's local part as
+        ``name``; everything else is a 1:1 DM with the bare JID as the
+        name.
+        """
+        is_muc = self._looks_like_muc(chat_id)
+        try:
+            bare = parse_jid(chat_id).bare
+        except Exception:
+            bare = chat_id
+        if is_muc:
+            local = bare.split("@", 1)[0] if "@" in bare else bare
+            return {"name": local or bare, "type": "group", "id": bare}
+        return {"name": bare, "type": "dm", "id": bare}
 
     async def send_typing(self, chat_id: str) -> None:
         client = self._client
@@ -670,8 +700,9 @@ PLATFORM_HINT = (
 )
 
 
-def _factory(cfg_extra: Mapping[str, Any] | None) -> XmppAdapter:
-    return XmppAdapter(load_config(cfg_extra))
+def _factory(config: Any) -> XmppAdapter:
+    """Hermes adapter factory — ``config`` is the gateway's PlatformConfig."""
+    return XmppAdapter(config)
 
 
 def _env_enable_hook(env: dict[str, str], yaml_extra: Mapping[str, Any] | None) -> None:
