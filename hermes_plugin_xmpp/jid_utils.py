@@ -1,4 +1,10 @@
-"""JID parsing helpers and session-key mapping for the XMPP gateway."""
+"""JID parsing and MUC addressing helpers for the XMPP gateway.
+
+The plugin no longer builds its own session keys — :func:`gateway.session.
+build_session_key` is the single source of truth. The adapter feeds the
+gateway a :class:`gateway.session.SessionSource` and lets the gateway
+derive the key.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +18,6 @@ except Exception:  # pragma: no cover - slixmpp is a runtime dep
 
 
 PLATFORM = "xmpp"
-CHAT_TYPE_PRIVATE = "private"
-CHAT_TYPE_GROUP = "group"
 
 
 @dataclass(frozen=True)
@@ -31,8 +35,13 @@ class ParsedJID:
 
 
 def parse_jid(value: str) -> ParsedJID:
-    """Parse a JID string into its components. Uses slixmpp when available,
-    falls back to a stdlib parser so unit tests don't need the library."""
+    """Parse a JID into its components.
+
+    Uses slixmpp's JID (which applies stringprep) when available so the
+    runtime behaviour matches the wire. The stdlib fallback exists so unit
+    tests don't need slixmpp; it case-folds local/domain to keep
+    ``bare_jid()`` consistent with the slixmpp path.
+    """
     if not value or not isinstance(value, str):
         raise ValueError("JID must be a non-empty string")
 
@@ -44,13 +53,14 @@ def parse_jid(value: str) -> ParsedJID:
         local, domain = bare.split("@", 1)
         return ParsedJID(bare=bare, local=local, domain=domain, resource=jid.resource or "")
 
-    # Fallback parser (no slixmpp present): JID = [local@]domain[/resource]
     rest, _, resource = value.partition("/")
     if "@" not in rest:
         raise ValueError(f"JID missing local part: {value!r}")
     local, domain = rest.split("@", 1)
     if not local or not domain:
         raise ValueError(f"Malformed JID: {value!r}")
+    local = local.lower()
+    domain = domain.lower()
     return ParsedJID(bare=f"{local}@{domain}", local=local, domain=domain, resource=resource)
 
 
@@ -59,7 +69,7 @@ def bare_jid(value: str) -> str:
 
 
 def normalize_jid_set(values: Iterable[str]) -> set[str]:
-    """Lower-case bare JIDs for case-insensitive membership checks."""
+    """Case-folded bare JIDs for membership checks."""
     out: set[str] = set()
     for v in values:
         v = (v or "").strip()
@@ -69,33 +79,19 @@ def normalize_jid_set(values: Iterable[str]) -> set[str]:
     return out
 
 
-def build_session_key(chat_type: str, chat_id: str) -> str:
-    """Local fallback for `gateway.session.build_session_key` — the live
-    gateway is expected to canonicalize this when it actually runs.
-
-    Format: ``agent:main:xmpp:{chat_type}:{chat_id}``
-    """
-    if chat_type not in (CHAT_TYPE_PRIVATE, CHAT_TYPE_GROUP):
-        raise ValueError(f"Unknown chat_type: {chat_type!r}")
-    return f"agent:main:{PLATFORM}:{chat_type}:{chat_id.lower()}"
-
-
-def chat_id_for_dm(from_jid: str) -> tuple[str, str]:
-    """Return (chat_type, chat_id) for a 1:1 message."""
-    return CHAT_TYPE_PRIVATE, parse_jid(from_jid).bare.lower()
-
-
-def chat_id_for_muc(room_jid: str) -> tuple[str, str]:
-    """Return (chat_type, chat_id) for a group/MUC message."""
-    return CHAT_TYPE_GROUP, parse_jid(room_jid).bare.lower()
-
-
 def is_addressed_to_nick(body: str, nick: str) -> bool:
-    """MUC addressing rule: message body must begin with the bot's nick,
-    optionally followed by ``:``, ``,`` or whitespace."""
+    """MUC addressing rule.
+
+    A message is "addressed to the bot" when its body opens with the bot's
+    nick, optionally preceded by ``@`` and followed by ``:``, ``,``, or
+    whitespace. ``@nick`` matches Telegram-style mentions so bridged users
+    don't get ignored.
+    """
     if not body or not nick:
         return False
     stripped = body.lstrip()
+    if stripped.startswith("@"):
+        stripped = stripped[1:]
     nick_low = nick.lower()
     head = stripped[: len(nick)].lower()
     if head != nick_low:
@@ -107,10 +103,12 @@ def is_addressed_to_nick(body: str, nick: str) -> bool:
 
 
 def strip_nick_prefix(body: str, nick: str) -> str:
-    """If the body begins with ``nick:``/``nick,``/``nick `` strip that prefix."""
+    """Remove the leading ``[@]nick[:|,| ]`` addressing prefix, if present."""
     if not is_addressed_to_nick(body, nick):
         return body
     stripped = body.lstrip()
+    if stripped.startswith("@"):
+        stripped = stripped[1:]
     rest = stripped[len(nick) :]
     if rest and rest[0] in (":", ","):
         rest = rest[1:]

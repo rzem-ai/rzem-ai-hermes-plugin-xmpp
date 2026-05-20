@@ -1,13 +1,15 @@
 """Hermes XMPP gateway adapter.
 
-Wraps a :class:`slixmpp.ClientXMPP` instance and adapts it to the Hermes
-:class:`BasePlatformAdapter` contract documented in
-``gateway/platforms/base.py`` of the Hermes core, plus the plugin loader
-hooks documented in ``gateway/platforms/ADDING_A_PLATFORM.md``.
+Wraps a :class:`slixmpp.ClientXMPP` instance and adapts it to Hermes's
+:class:`gateway.platforms.base.BasePlatformAdapter` contract. Closest
+in-tree reference is ``plugins/platforms/irc/adapter.py``.
 
-The closest in-tree analog is ``plugins/platforms/irc/adapter.py``; this
-file follows its ``register()``-returns-dict pattern, reconnect-with-
-backoff loop, and standalone cron sender.
+Inbound stanzas are normalised into a real :class:`MessageEvent` with a
+:class:`SessionSource` and handed to ``self.handle_message`` — the same
+entry point every built-in adapter uses. The gateway is the single source
+of truth for session keys, routing, and (where configured) cross-platform
+mirroring; the adapter's job is to deliver clean events and accept clean
+sends.
 """
 
 from __future__ import annotations
@@ -18,9 +20,17 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
+from ._compat import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    Platform,
+    SendResult,
+    SessionSource,
+)
 from .config import XmppConfig, is_configured, load_config, validate
 from .history import (
     DedupLRU,
@@ -29,13 +39,11 @@ from .history import (
     collect_mam_results,
     iter_carbon_payload,
     replay_should_respond,
+    stanza_timestamp,
 )
 from .jid_utils import (
     PLATFORM,
     bare_jid,
-    build_session_key,
-    chat_id_for_dm,
-    chat_id_for_muc,
     is_addressed_to_nick,
     parse_jid,
     strip_nick_prefix,
@@ -45,67 +53,8 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# BasePlatformAdapter import shim.
-#
-# At runtime the gateway exposes ``gateway.platforms.base.BasePlatformAdapter``
-# along with a ``SendResult`` dataclass. When the plugin is imported outside
-# the gateway (e.g. by unit tests) we substitute a minimal stub so the module
-# loads cleanly.
-# ---------------------------------------------------------------------------
-try:  # pragma: no cover - exercised only when installed alongside Hermes
-    from gateway.platforms.base import BasePlatformAdapter, SendResult  # type: ignore
-except Exception:  # pragma: no cover
-    @dataclass
-    class SendResult:  # type: ignore[no-redef]
-        ok: bool = True
-        message_ids: list[str] = field(default_factory=list)
-        error: str | None = None
-
-    class BasePlatformAdapter:  # type: ignore[no-redef]
-        """Minimal stand-in used only when the real gateway is not installed."""
-
-        def __init__(self) -> None:
-            self._message_handler: Callable[[Any], Awaitable[None]] | None = None
-            self._busy_handler: Callable[[Any], Awaitable[None]] | None = None
-            self._session_store: Any = None
-
-        def set_message_handler(self, handler: Callable[[Any], Awaitable[None]]) -> None:
-            self._message_handler = handler
-
-        def set_busy_session_handler(self, handler: Callable[[Any], Awaitable[None]]) -> None:
-            self._busy_handler = handler
-
-        def set_session_store(self, store: Any) -> None:
-            self._session_store = store
-
-
-# ---------------------------------------------------------------------------
-# MessageEvent — the gateway's real event class lives in the core, but we
-# only need a small dict-shaped object that the gateway accepts. The fields
-# we set are the union of what BasePlatformAdapter callers expect.
-# ---------------------------------------------------------------------------
-@dataclass
-class XmppMessageEvent:
-    platform: str
-    chat_type: str
-    chat_id: str
-    session_key: str
-    sender_jid: str
-    sender_display: str
-    text: str
-    raw_id: str
-    is_muc: bool
-    addressed_to_bot: bool
-    replay: bool = False
-    extra: dict[str, Any] = field(default_factory=dict)
-
-
-MessageHandler = Callable[[XmppMessageEvent], Awaitable[None]]
-
-
-# ---------------------------------------------------------------------------
 # Markdown stripper. XMPP allows XHTML-IM but client support is uneven, and
-# the Telegram/IRC adapters both default to plain text — match that.
+# IRC defaults to plain text — match that for symmetry.
 # ---------------------------------------------------------------------------
 _MD_BOLD_OR_ITALIC = re.compile(r"(\*{1,3}|_{1,3})(.+?)\1", re.DOTALL)
 _MD_INLINE_CODE = re.compile(r"`([^`]+)`")
@@ -128,6 +77,32 @@ def _strip_markdown(text: str) -> str:
 _CHUNK_BYTES = 4096
 
 
+def _split_utf8_chunk(data: bytes, limit: int) -> list[bytes]:
+    """Slice ``data`` into ``<= limit`` byte chunks on UTF-8 boundaries.
+
+    The naive ``data[i:i+limit]`` slice can land in the middle of a
+    multi-byte code point. We back up to the last code-point start byte
+    so every chunk decodes cleanly.
+    """
+    out: list[bytes] = []
+    i = 0
+    n = len(data)
+    while i < n:
+        end = min(i + limit, n)
+        if end < n:
+            # Continuation bytes are 0b10xxxxxx (0x80-0xBF). Back up until
+            # we land on a start byte.
+            while end > i and (data[end] & 0xC0) == 0x80:
+                end -= 1
+            if end == i:
+                # Single code point larger than limit — shouldn't happen
+                # for real UTF-8, but emit the raw slice to make progress.
+                end = min(i + limit, n)
+        out.append(data[i:end])
+        i = end
+    return out
+
+
 def _chunk(text: str, limit: int = _CHUNK_BYTES) -> list[str]:
     if len(text.encode("utf-8")) <= limit:
         return [text]
@@ -135,46 +110,40 @@ def _chunk(text: str, limit: int = _CHUNK_BYTES) -> list[str]:
     buf: list[str] = []
     size = 0
     for line in text.splitlines(keepends=True):
-        line_size = len(line.encode("utf-8"))
-        if line_size > limit:
+        line_bytes = line.encode("utf-8")
+        if len(line_bytes) > limit:
             if buf:
                 parts.append("".join(buf))
                 buf, size = [], 0
-            # Split very long line on UTF-8 boundaries.
-            data = line.encode("utf-8")
-            for i in range(0, len(data), limit):
-                parts.append(data[i : i + limit].decode("utf-8", errors="ignore"))
+            for piece in _split_utf8_chunk(line_bytes, limit):
+                parts.append(piece.decode("utf-8"))
             continue
-        if size + line_size > limit and buf:
+        if size + len(line_bytes) > limit and buf:
             parts.append("".join(buf))
             buf, size = [], 0
         buf.append(line)
-        size += line_size
+        size += len(line_bytes)
     if buf:
         parts.append("".join(buf))
     return parts
 
 
-# Backoff sequence matches the IRC adapter: 2s, 4s, 8s, 16s, 32s capped.
+# Backoff schedule for reconnect — matches the IRC adapter.
 _BACKOFF_SCHEDULE = (2, 4, 8, 16, 32)
 
 
 class XmppAdapter(BasePlatformAdapter):
     """Hermes gateway adapter for XMPP."""
 
-    def __init__(self, config: Any, **kwargs: Any) -> None:
-        """``config`` is the Hermes ``PlatformConfig`` for the ``xmpp`` slot.
-
-        ``XmppConfig`` is rebuilt from ``config.extra`` (merged with env
-        vars by :func:`load_config`), so the adapter stays usable as
-        long as either the env or the YAML extras carry ``XMPP_JID`` /
-        ``XMPP_PASSWORD``.
-        """
-        from gateway.config import Platform  # lazy: not needed in tests
-
+    def __init__(self, config: Any, **_kwargs: Any) -> None:
         super().__init__(config=config, platform=Platform("xmpp"))
         extra = getattr(config, "extra", None) or {}
-        self.cfg = load_config(extra)
+        # Tests construct the adapter directly with an XmppConfig; the live
+        # gateway passes a PlatformConfig whose ``.extra`` carries the YAML.
+        if isinstance(config, XmppConfig):
+            self.cfg = config
+        else:
+            self.cfg = load_config(extra)
         self._client: Any | None = None
         self._connected_event: asyncio.Event = asyncio.Event()
         self._stopping: bool = False
@@ -182,6 +151,10 @@ class XmppAdapter(BasePlatformAdapter):
         self._dedup = DedupLRU()
         self._last_seen = LastSeenStore(self.cfg.bare_jid)
         self._typing_chats: set[str] = set()
+
+    @property
+    def name(self) -> str:
+        return "XMPP"
 
     # -- BasePlatformAdapter API ---------------------------------------------
 
@@ -201,7 +174,6 @@ class XmppAdapter(BasePlatformAdapter):
             "xep_0045",  # MUC
             "xep_0048",  # bookmarks
             "xep_0066",  # OOB data (image previews)
-            "xep_0071",  # XHTML-IM (optional rendering)
             "xep_0085",  # chat states (typing)
             "xep_0199",  # ping
             "xep_0280",  # message carbons
@@ -266,13 +238,13 @@ class XmppAdapter(BasePlatformAdapter):
     ) -> SendResult:
         client = self._client
         if client is None:
-            return SendResult(ok=False, error="XMPP client not connected")
+            return SendResult(success=False, error="XMPP client not connected", retryable=True)
 
         is_muc = bool(metadata and metadata.get("is_muc")) or self._looks_like_muc(chat_id)
         mtype = "groupchat" if is_muc else "chat"
         body = _strip_markdown(content or "")
         if not body.strip():
-            return SendResult(ok=True, message_ids=[])
+            return SendResult(success=True)
 
         message_ids: list[str] = []
         for chunk in _chunk(body):
@@ -288,22 +260,25 @@ class XmppAdapter(BasePlatformAdapter):
                     message_ids.append(msg_id)
             except Exception as exc:
                 log.warning("XMPP plugin: send() failed: %s", exc)
-                return SendResult(ok=False, message_ids=message_ids, error=str(exc))
+                return SendResult(
+                    success=False,
+                    message_id=message_ids[-1] if message_ids else None,
+                    continuation_message_ids=tuple(message_ids[:-1]),
+                    error=str(exc),
+                    retryable=True,
+                )
             await asyncio.sleep(0)  # let the writer flush between chunks
 
-        return SendResult(ok=True, message_ids=message_ids)
+        last = message_ids[-1] if message_ids else None
+        prefix = tuple(message_ids[:-1])
+        return SendResult(success=True, message_id=last, continuation_message_ids=prefix)
 
     # -- Optional capabilities -----------------------------------------------
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Return a minimal chat descriptor for ``chat_id``.
 
-        XMPP carries no central directory of chat names, so this is a
-        structural classification based on the JID alone: a bare JID
-        whose local part looks like a MUC room (``_looks_like_muc``)
-        is reported as ``type='group'`` with the room's local part as
-        ``name``; everything else is a 1:1 DM with the bare JID as the
-        name.
+        XMPP has no central directory; classify by JID structure.
         """
         is_muc = self._looks_like_muc(chat_id)
         try:
@@ -321,10 +296,6 @@ class XmppAdapter(BasePlatformAdapter):
             return
         is_muc = self._looks_like_muc(chat_id)
         mtype = "groupchat" if is_muc else "chat"
-        with suppress(Exception):
-            client.send_message(mto=chat_id, mtype=mtype, mbody=None, mfrom=None,
-                                mnick=None, mhtml=None, msubject=None)
-        # XEP-0085 chat state
         with suppress(Exception):
             msg = client.make_message(mto=chat_id, mtype=mtype)
             msg["chat_state"] = "composing"
@@ -354,33 +325,30 @@ class XmppAdapter(BasePlatformAdapter):
     ) -> SendResult:
         client = self._client
         if client is None:
-            return SendResult(ok=False, error="XMPP client not connected")
+            return SendResult(success=False, error="XMPP client not connected", retryable=True)
         if not os.path.isfile(path):
-            return SendResult(ok=False, error=f"image file not found: {path}")
+            return SendResult(success=False, error=f"image file not found: {path}")
 
         url: str | None = None
         try:
-            upload = client["xep_0363"]
             # Let slixmpp's XEP-0363 plugin discover the upload service via
-            # disco — ejabberd's ``mod_http_upload`` lives on its own
-            # component subdomain (e.g. ``upload.chat.rzem.ai``), not the
-            # user's own domain, so hard-coding ``domain=self.cfg.domain``
-            # would miss it.
-            url = await upload.upload_file(path)
+            # disco — ejabberd's mod_http_upload runs on its own component
+            # subdomain, not the user's own domain.
+            url = await client["xep_0363"].upload_file(path)
         except Exception as exc:
             log.warning("XMPP plugin: HTTP upload failed (%s); sending caption only", exc)
 
         is_muc = bool(metadata and metadata.get("is_muc")) or self._looks_like_muc(chat_id)
         mtype = "groupchat" if is_muc else "chat"
 
-        body_parts = []
+        body_parts: list[str] = []
         if caption:
             body_parts.append(caption)
         if url:
             body_parts.append(url)
         body = "\n".join(body_parts) if body_parts else (url or "")
         if not body:
-            return SendResult(ok=False, error="nothing to send")
+            return SendResult(success=False, error="nothing to send")
 
         try:
             msg = client.make_message(mto=chat_id, mbody=body, mtype=mtype)
@@ -388,9 +356,9 @@ class XmppAdapter(BasePlatformAdapter):
                 with suppress(Exception):
                     msg["oob"]["url"] = url
             msg.send()
-            return SendResult(ok=True, message_ids=[str(msg.get("id", ""))])
+            return SendResult(success=True, message_id=str(msg.get("id", "")) or None)
         except Exception as exc:
-            return SendResult(ok=False, error=str(exc))
+            return SendResult(success=False, error=str(exc), retryable=True)
 
     # -- slixmpp event handlers ----------------------------------------------
 
@@ -404,14 +372,12 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception as exc:
             log.debug("XMPP plugin: presence/roster setup: %s", exc)
 
-        # Enable Message Carbons.
         with suppress(Exception):
             await client["xep_0280"].enable()
 
         # MAM catch-up (DM scope).
         await self._mam_catchup(scope=None, with_jid=None)
 
-        # Join configured MUC rooms.
         for room in self.cfg.muc_rooms:
             room_bare = parse_jid(room).bare
             try:
@@ -422,7 +388,6 @@ class XmppAdapter(BasePlatformAdapter):
             except Exception as exc:
                 log.warning("XMPP plugin: could not join %s: %s", room_bare, exc)
                 continue
-            # MAM catch-up per room.
             await self._mam_catchup(scope=f"muc:{room_bare.lower()}", with_jid=room_bare)
 
         self._connected_event.set()
@@ -479,7 +444,7 @@ class XmppAdapter(BasePlatformAdapter):
         body = self._extract_body(stanza)
         if body is None:
             return
-        from_jid = str(stanza.get("from", "")) if hasattr(stanza, "get") else ""
+        from_jid = self._extract_from(stanza)
         if not from_jid:
             return
         try:
@@ -487,37 +452,46 @@ class XmppAdapter(BasePlatformAdapter):
         except ValueError:
             return
         if sender_bare.lower() == self.cfg.bare_jid.lower():
-            return  # ignore stanzas from ourselves
+            return  # our own stanza
         if not self._is_allowed(sender_bare):
             log.info("XMPP plugin: denied DM from %s (not in XMPP_ALLOWED_JIDS)", sender_bare)
             return
 
-        key = StanzaKey.from_stanza(stanza)
-        if not self._dedup.mark(key):
+        if replay and not self._replay_is_fresh(stanza):
+            # Stale history — update cursor + dedup, but don't deliver.
+            self._dedup.mark(StanzaKey.from_stanza(stanza))
+            self._update_cursor(scope=None, stanza=stanza)
             return
 
-        chat_type, chat_id = chat_id_for_dm(from_jid)
-        event = XmppMessageEvent(
-            platform=PLATFORM,
-            chat_type=chat_type,
-            chat_id=chat_id,
-            session_key=build_session_key(chat_type, chat_id),
-            sender_jid=sender_bare,
-            sender_display=sender_bare,
-            text=body,
-            raw_id=str(stanza.get("id", "")) if hasattr(stanza, "get") else "",
-            is_muc=False,
-            addressed_to_bot=True,
-            replay=replay,
+        if not self._dedup.mark(StanzaKey.from_stanza(stanza)):
+            return
+
+        raw_id = self._extract_id(stanza)
+        source = self.build_source(
+            chat_id=sender_bare,
+            chat_name=sender_bare,
+            chat_type="dm",
+            user_id=sender_bare,
+            user_name=sender_bare,
+            message_id=raw_id or None,
         )
-        await self._update_cursor(scope=None, stanza=stanza)
-        await self._deliver(event, stanza)
+        event = MessageEvent(
+            text=body,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=stanza,
+            message_id=raw_id or None,
+            timestamp=self._event_timestamp(stanza),
+        )
+
+        self._update_cursor(scope=None, stanza=stanza)
+        await self._deliver(event)
 
     async def _dispatch_muc(self, stanza: Any, *, replay: bool) -> None:
         body = self._extract_body(stanza)
         if body is None:
             return
-        from_jid = str(stanza.get("from", "")) if hasattr(stanza, "get") else ""
+        from_jid = self._extract_from(stanza)
         if not from_jid:
             return
         room_jid, _, nick = from_jid.partition("/")
@@ -527,55 +501,51 @@ class XmppAdapter(BasePlatformAdapter):
             return  # our own MUC echo
 
         addressed = is_addressed_to_nick(body, self.cfg.muc_nickname)
-        if not addressed:
+        reply_to_bot = self._reply_targets_bot(stanza)
+        if not (addressed or reply_to_bot):
             return
 
-        # In MUC, the real sender is opaque (the room rewrites from=); we
-        # use the room JID for authorization, since MUC membership is the
-        # bouncer. allow_all_users bypasses if set.
-        if not self.cfg.allow_all_users and self.cfg.allowed_jids:
-            # Optional stricter check: allow MUC traffic unconditionally, since
-            # joining the room is itself an access check. Log for visibility.
-            log.debug("XMPP plugin: MUC message in %s (per-room allow lists not enforced)", room_jid)
-
-        key = StanzaKey.from_stanza(stanza)
-        if not self._dedup.mark(key):
+        if replay and not self._replay_is_fresh(stanza):
+            self._dedup.mark(StanzaKey.from_stanza(stanza))
+            self._update_cursor(scope=f"muc:{room_jid.lower()}", stanza=stanza)
             return
 
-        text = strip_nick_prefix(body, self.cfg.muc_nickname)
-        chat_type, chat_id = chat_id_for_muc(room_jid)
-        event = XmppMessageEvent(
-            platform=PLATFORM,
-            chat_type=chat_type,
-            chat_id=chat_id,
-            session_key=build_session_key(chat_type, chat_id),
-            sender_jid=from_jid,
-            sender_display=nick or from_jid,
-            text=text,
-            raw_id=str(stanza.get("id", "")) if hasattr(stanza, "get") else "",
-            is_muc=True,
-            addressed_to_bot=True,
-            replay=replay,
+        if not self._dedup.mark(StanzaKey.from_stanza(stanza)):
+            return
+
+        text = strip_nick_prefix(body, self.cfg.muc_nickname) if addressed else body
+        raw_id = self._extract_id(stanza)
+        # In a MUC, ``from`` is ``room@host/nick``. The full MUC JID gives
+        # us per-participant session isolation (matching how Telegram groups
+        # work with group_sessions_per_user).
+        source = self.build_source(
+            chat_id=room_jid.lower(),
+            chat_name=room_jid.split("@", 1)[0] if "@" in room_jid else room_jid,
+            chat_type="group",
+            user_id=from_jid,
+            user_name=nick or from_jid,
+            message_id=raw_id or None,
         )
-        await self._update_cursor(scope=f"muc:{room_jid.lower()}", stanza=stanza)
-        await self._deliver(event, stanza)
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=stanza,
+            message_id=raw_id or None,
+            timestamp=self._event_timestamp(stanza),
+        )
 
-    async def _deliver(self, event: XmppMessageEvent, stanza: Any) -> None:
-        handler = getattr(self, "_message_handler", None)
-        if handler is None:
-            log.debug("XMPP plugin: no message handler registered; dropping %s", event.chat_id)
-            return
+        self._update_cursor(scope=f"muc:{room_jid.lower()}", stanza=stanza)
+        await self._deliver(event)
 
-        if event.replay:
-            ts = _stanza_timestamp(stanza)
-            if not replay_should_respond(ts, grace_seconds=self.cfg.mam_replay_grace_seconds):
-                # Ingest silently: still notify the gateway but mark it.
-                event.extra["silent"] = True
-
+    async def _deliver(self, event: MessageEvent) -> None:
         try:
-            await handler(event)
+            await self.handle_message(event)
         except Exception:
-            log.exception("XMPP plugin: gateway handler raised for %s", event.chat_id)
+            log.exception(
+                "XMPP plugin: gateway handler raised for %s",
+                event.source.chat_id if event.source else "<unknown>",
+            )
 
     # -- MAM catch-up --------------------------------------------------------
 
@@ -583,8 +553,7 @@ class XmppAdapter(BasePlatformAdapter):
         client = self._client
         if client is None:
             return
-        cursor = self._last_seen.get(scope=scope)
-        start = cursor.get("ts_iso") or cursor.get("ts")
+        start = self._last_seen.get_start_iso(scope=scope)
         try:
             mam = client["xep_0313"]
         except Exception:
@@ -601,19 +570,21 @@ class XmppAdapter(BasePlatformAdapter):
             log.debug("XMPP plugin: MAM catch-up (%s) failed: %s", scope or "dm", exc)
             return
 
-        # slixmpp's API returns either a list of forwarded stanzas or a
-        # results envelope; ``collect_mam_results`` copes with both.
+        # slixmpp returns either a list of forwarded stanzas or a results
+        # envelope; collect_mam_results copes with both.
         try:
             inner_list = list(getattr(results, "results", None) or results)
         except TypeError:
-            inner_list = []
-        forwarded = collect_mam_results(inner_list)
-        forwarded = forwarded[: self.cfg.mam_catchup_limit]
+            return
+        forwarded = collect_mam_results(inner_list)[: self.cfg.mam_catchup_limit]
         if not forwarded:
             return
 
-        log.info("XMPP plugin: replaying %d MAM stanza(s) for scope=%s",
-                 len(forwarded), scope or "dm")
+        log.info(
+            "XMPP plugin: replaying %d MAM stanza(s) for scope=%s",
+            len(forwarded),
+            scope or "dm",
+        )
         for stanza in forwarded:
             mtype = (stanza.get("type") if hasattr(stanza, "get") else None) or "chat"
             try:
@@ -624,17 +595,27 @@ class XmppAdapter(BasePlatformAdapter):
             except Exception:
                 log.exception("XMPP plugin: MAM replay item failed")
 
-    async def _update_cursor(self, *, scope: str | None, stanza: Any) -> None:
-        sid = None
+    def _update_cursor(self, *, scope: str | None, stanza: Any) -> None:
+        sid: str | None = None
         try:
             sid = stanza["stanza_id"]["id"]
         except Exception:
             pass
-        ts = _stanza_timestamp(stanza)
+        ts = stanza_timestamp(stanza)
+        # Fresh (non-replay) stanzas have no delay element; stamp them as
+        # "now" so the cursor still advances.
+        if ts is None:
+            ts = datetime.now(tz=timezone.utc).timestamp()
         if sid or ts is not None:
             self._last_seen.update(scope, stanza_id=sid, ts=ts)
 
     # -- Helpers -------------------------------------------------------------
+
+    def _replay_is_fresh(self, stanza: Any) -> bool:
+        return replay_should_respond(
+            stanza_timestamp(stanza),
+            grace_seconds=self.cfg.mam_replay_grace_seconds,
+        )
 
     def _is_allowed(self, sender_bare: str) -> bool:
         if self.cfg.allow_all_users:
@@ -651,6 +632,20 @@ class XmppAdapter(BasePlatformAdapter):
                     return True
         return False
 
+    def _reply_targets_bot(self, stanza: Any) -> bool:
+        """XEP-0461: ``<reply to="..."/>`` lets MUC users address the bot
+        without typing the nick prefix. Matches Telegram-style reply UX."""
+        try:
+            reply_to = stanza["reply"]["to"]
+        except Exception:
+            return False
+        if not reply_to:
+            return False
+        try:
+            return bare_jid(str(reply_to)).lower() == self.cfg.bare_jid.lower()
+        except ValueError:
+            return False
+
     @staticmethod
     def _extract_body(stanza: Any) -> str | None:
         try:
@@ -664,34 +659,29 @@ class XmppAdapter(BasePlatformAdapter):
             return None
         return body
 
+    @staticmethod
+    def _extract_from(stanza: Any) -> str:
+        if not hasattr(stanza, "get"):
+            return ""
+        return str(stanza.get("from", "") or "")
 
-def _stanza_timestamp(stanza: Any) -> float | None:
-    """Pull a UTC timestamp from a stanza if it carries an XEP-0203 delay."""
-    try:
-        delay = stanza["delay"]
-        stamp = delay["stamp"] if delay is not None else None
-    except Exception:
-        stamp = None
-    if not stamp:
-        return None
-    from datetime import datetime
+    @staticmethod
+    def _extract_id(stanza: Any) -> str:
+        if not hasattr(stanza, "get"):
+            return ""
+        return str(stanza.get("id", "") or "")
 
-    if isinstance(stamp, datetime):
-        return stamp.timestamp()
-    try:
-        s = str(stamp).replace("Z", "+00:00")
-        return datetime.fromisoformat(s).timestamp()
-    except ValueError:
-        return None
+    @staticmethod
+    def _event_timestamp(stanza: Any) -> datetime:
+        ts = stanza_timestamp(stanza)
+        if ts is None:
+            return datetime.now(tz=timezone.utc)
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
-# Plugin loader entry point.
-#
-# Hermes's plugin loader calls ``register(ctx)`` and expects back a dict
-# describing the platform, factory, and optional hooks. The IRC plugin in
-# ``plugins/platforms/irc/adapter.py`` is the canonical reference for the
-# shape used here.
+# Platform hint + interactive setup. These are surfaced by the gateway's
+# plugin loader via the outer ``__init__.py`` shim.
 # ---------------------------------------------------------------------------
 PLATFORM_HINT = (
     "You are talking through XMPP. Use plain text — XHTML-IM and markdown "
@@ -700,46 +690,14 @@ PLATFORM_HINT = (
 )
 
 
-def _factory(config: Any) -> XmppAdapter:
+def adapter_factory(config: Any) -> XmppAdapter:
     """Hermes adapter factory — ``config`` is the gateway's PlatformConfig."""
     return XmppAdapter(config)
 
 
-def _env_enable_hook(env: dict[str, str], yaml_extra: Mapping[str, Any] | None) -> None:
-    """Seed environment variables from the gateway-supplied YAML so the
-    adapter sees a consistent view regardless of how the user configured
-    things. Called by the gateway before factory()."""
-    yaml = yaml_extra or {}
-    mapping = {
-        "XMPP_JID": "jid",
-        "XMPP_PASSWORD": "password",
-        "XMPP_SERVER": "server",
-        "XMPP_PORT": "port",
-        "XMPP_USE_TLS": "use_tls",
-        "XMPP_RESOURCE": "resource",
-        "XMPP_MUC_ROOMS": "muc_rooms",
-        "XMPP_MUC_NICKNAME": "muc_nickname",
-        "XMPP_ALLOWED_JIDS": "allowed_jids",
-        "XMPP_ALLOW_ALL_USERS": "allow_all_users",
-        "XMPP_HOME_JID": "home_jid",
-        "XMPP_MAM_REPLAY_GRACE_SECONDS": "mam_replay_grace_seconds",
-        "XMPP_MAM_CATCHUP_LIMIT": "mam_catchup_limit",
-    }
-    for env_key, yaml_key in mapping.items():
-        if env.get(env_key):
-            continue
-        value = yaml.get(yaml_key)
-        if value is None or value == "":
-            continue
-        if isinstance(value, (list, tuple, set)):
-            env[env_key] = ",".join(str(x) for x in value)
-        else:
-            env[env_key] = str(value)
-
-
-def _interactive_setup() -> dict[str, str]:
+def interactive_setup() -> dict[str, str]:
     """CLI wizard invoked by ``hermes gateway setup`` when the user picks
-    XMPP. Returns the env-var assignments to persist to ``~/.hermes/.env``."""
+    XMPP. Returns env-var assignments to persist to ``~/.hermes/.env``."""
     import getpass
 
     def ask(prompt: str, *, default: str = "", secret: bool = False) -> str:
@@ -778,30 +736,13 @@ def _interactive_setup() -> dict[str, str]:
     return out
 
 
-def _standalone_send(recipient: str, body: str, *, extra: Mapping[str, Any] | None = None,
-                     is_muc: bool = False) -> bool:
-    from ._standalone import standalone_send
-
-    return standalone_send(recipient, body, extra=extra, is_muc=is_muc)
-
-
-def register(ctx: Any = None) -> dict[str, Any]:
-    """Hermes plugin entry point.
-
-    The ``ctx`` argument is the plugin context object the gateway passes
-    in; we accept it for forward compatibility but do not currently need
-    anything from it.
-    """
-    del ctx  # currently unused
-    return {
-        "name": PLATFORM,
-        "label": "XMPP",
-        "kind": "platform",
-        "factory": _factory,
-        "is_configured": is_configured,
-        "validate": validate,
-        "interactive_setup": _interactive_setup,
-        "env_enable_hook": _env_enable_hook,
-        "standalone_sender": _standalone_send,
-        "platform_hint": PLATFORM_HINT,
-    }
+__all__ = [
+    "PLATFORM",
+    "PLATFORM_HINT",
+    "XmppAdapter",
+    "adapter_factory",
+    "interactive_setup",
+    "is_configured",
+    "load_config",
+    "validate",
+]

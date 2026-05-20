@@ -1,17 +1,17 @@
 """Adapter dispatch tests that do not touch the network.
 
 These exercise the message-handling pipeline by feeding a hand-crafted
-fake stanza into the adapter and checking what the gateway-side message
-handler receives. The real ``slixmpp`` client is never constructed.
+fake stanza into the adapter and checking what reaches the registered
+gateway handler. The real ``slixmpp`` client is never constructed.
 """
 
 import asyncio
 
 import pytest
 
+from hermes_plugin_xmpp._compat import MessageEvent, MessageType
 from hermes_plugin_xmpp.adapter import (
     XmppAdapter,
-    XmppMessageEvent,
     _chunk,
     _strip_markdown,
 )
@@ -50,6 +50,9 @@ class _FakeStanza:
         return key in self._data
 
 
+# ── pure helpers ──────────────────────────────────────────────────────────
+
+
 def test_strip_markdown_basics():
     assert _strip_markdown("**bold** and *italic*") == "bold and italic"
     assert _strip_markdown("see [docs](https://x.test)") == "see docs (https://x.test)"
@@ -67,7 +70,6 @@ def test_chunk_splits_on_lines():
     chunks = _chunk(text)
     assert len(chunks) > 1
     assert all(len(c.encode("utf-8")) <= 4096 for c in chunks)
-    # Round-trip
     assert "".join(chunks).startswith("line line")
 
 
@@ -78,18 +80,36 @@ def test_chunk_splits_giant_single_line():
     assert "".join(chunks) == text
 
 
+def test_chunk_preserves_multibyte_codepoints():
+    # 3-byte CJK char; 9000 bytes worth would naively split a codepoint.
+    text = "漢" * 3000
+    chunks = _chunk(text, limit=1024)
+    assert "".join(chunks) == text
+    # Every chunk must decode round-trip without losing characters.
+    for c in chunks:
+        assert c.encode("utf-8").decode("utf-8") == c
+
+
+# ── dispatch ──────────────────────────────────────────────────────────────
+
+
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
+    return asyncio.run(coro)
 
 
-def test_dispatch_dm_routes_to_handler():
-    adapter = _make_adapter()
-    received: list[XmppMessageEvent] = []
+def _capture(adapter):
+    received: list[MessageEvent] = []
 
     async def handler(event):
         received.append(event)
 
     adapter.set_message_handler(handler)
+    return received
+
+
+def test_dispatch_dm_routes_to_handler():
+    adapter = _make_adapter()
+    received = _capture(adapter)
 
     stanza = _FakeStanza({
         "body": "hello bot",
@@ -101,22 +121,21 @@ def test_dispatch_dm_routes_to_handler():
 
     assert len(received) == 1
     event = received[0]
-    assert event.chat_type == "private"
-    assert event.chat_id == "me@example.com"
-    assert event.session_key == "agent:main:xmpp:private:me@example.com"
+    assert isinstance(event, MessageEvent)
+    assert event.message_type == MessageType.TEXT
     assert event.text == "hello bot"
-    assert event.is_muc is False
-    assert event.replay is False
+    assert event.message_id == "stanza-1"
+    src = event.source
+    assert src is not None
+    assert src.platform.value == "xmpp"
+    assert src.chat_type == "dm"
+    assert src.chat_id == "me@example.com"
+    assert src.user_id == "me@example.com"
 
 
 def test_dispatch_dm_blocks_unauthorized_sender():
     adapter = _make_adapter()
-    received: list[XmppMessageEvent] = []
-
-    async def handler(event):
-        received.append(event)
-
-    adapter.set_message_handler(handler)
+    received = _capture(adapter)
 
     stanza = _FakeStanza({
         "body": "let me in",
@@ -130,12 +149,7 @@ def test_dispatch_dm_blocks_unauthorized_sender():
 
 def test_dispatch_dm_dedupes():
     adapter = _make_adapter()
-    received: list[XmppMessageEvent] = []
-
-    async def handler(event):
-        received.append(event)
-
-    adapter.set_message_handler(handler)
+    received = _capture(adapter)
 
     stanza = _FakeStanza({
         "body": "hi",
@@ -148,16 +162,23 @@ def test_dispatch_dm_dedupes():
     assert len(received) == 1
 
 
+def test_dispatch_dm_ignores_own_bare_jid():
+    adapter = _make_adapter()
+    received = _capture(adapter)
+    stanza = _FakeStanza({
+        "body": "self",
+        "from": "bot@example.com/other",
+        "id": "self-1",
+        "stanza_id": {"id": "self-sid"},
+    })
+    _run(adapter._dispatch_dm(stanza, replay=False))
+    assert received == []
+
+
 def test_dispatch_muc_requires_addressing():
     adapter = _make_adapter()
-    received: list[XmppMessageEvent] = []
+    received = _capture(adapter)
 
-    async def handler(event):
-        received.append(event)
-
-    adapter.set_message_handler(handler)
-
-    # Unaddressed message — ignored.
     stanza = _FakeStanza({
         "body": "general chatter",
         "from": "team@conf.example.com/alice",
@@ -167,7 +188,6 @@ def test_dispatch_muc_requires_addressing():
     _run(adapter._dispatch_muc(stanza, replay=False))
     assert received == []
 
-    # Addressed — accepted.
     stanza2 = _FakeStanza({
         "body": "hermes-bot: status?",
         "from": "team@conf.example.com/alice",
@@ -176,21 +196,47 @@ def test_dispatch_muc_requires_addressing():
     })
     _run(adapter._dispatch_muc(stanza2, replay=False))
     assert len(received) == 1
-    assert received[0].chat_type == "group"
-    assert received[0].chat_id == "team@conf.example.com"
-    assert received[0].text == "status?"
-    assert received[0].is_muc is True
+    event = received[0]
+    assert event.text == "status?"
+    assert event.source.chat_type == "group"
+    assert event.source.chat_id == "team@conf.example.com"
+    assert event.source.user_id == "team@conf.example.com/alice"
+    assert event.source.user_name == "alice"
+
+
+def test_dispatch_muc_accepts_at_nick_mention():
+    adapter = _make_adapter()
+    received = _capture(adapter)
+    stanza = _FakeStanza({
+        "body": "@hermes-bot: ping",
+        "from": "team@conf.example.com/bob",
+        "id": "muc-at",
+        "stanza_id": {"id": "muc-at-sid"},
+    })
+    _run(adapter._dispatch_muc(stanza, replay=False))
+    assert len(received) == 1
+    assert received[0].text == "ping"
+
+
+def test_dispatch_muc_accepts_xep_0461_reply_to_bot():
+    adapter = _make_adapter()
+    received = _capture(adapter)
+    stanza = _FakeStanza({
+        "body": "no prefix, just a reply",
+        "from": "team@conf.example.com/carol",
+        "id": "muc-reply",
+        "stanza_id": {"id": "muc-reply-sid"},
+        "reply": {"to": "bot@example.com"},
+    })
+    _run(adapter._dispatch_muc(stanza, replay=False))
+    assert len(received) == 1
+    # Reply path keeps the original body — no nick prefix to strip.
+    assert received[0].text == "no prefix, just a reply"
 
 
 def test_dispatch_muc_ignores_own_echo():
     adapter = _make_adapter()
-    received: list[XmppMessageEvent] = []
-
-    async def handler(event):
-        received.append(event)
-
-    adapter.set_message_handler(handler)
-
+    received = _capture(adapter)
     stanza = _FakeStanza({
         "body": "hermes-bot: hi all",
         "from": "team@conf.example.com/hermes-bot",
@@ -203,13 +249,7 @@ def test_dispatch_muc_ignores_own_echo():
 
 def test_dispatch_dm_carbon_sent_is_swallowed():
     adapter = _make_adapter()
-    received: list[XmppMessageEvent] = []
-
-    async def handler(event):
-        received.append(event)
-
-    adapter.set_message_handler(handler)
-
+    received = _capture(adapter)
     inner = _FakeStanza({
         "body": "I sent this from my phone",
         "from": "bot@example.com/phone",
@@ -221,50 +261,56 @@ def test_dispatch_dm_carbon_sent_is_swallowed():
     assert received == []
 
 
-def test_replay_outside_grace_marks_silent(monkeypatch):
-    adapter = _make_adapter(mam_replay_grace_seconds=1)
-    received: list[XmppMessageEvent] = []
-
-    async def handler(event):
-        received.append(event)
-
-    adapter.set_message_handler(handler)
-
-    # Stanza with an old XEP-0203 delay timestamp.
+def test_replay_inside_grace_delivers():
+    adapter = _make_adapter(mam_replay_grace_seconds=86_400 * 365 * 50)
+    received = _capture(adapter)
     stanza = _FakeStanza({
-        "body": "old message",
+        "body": "recent enough",
+        "from": "me@example.com/x",
+        "id": "fresh-1",
+        "stanza_id": {"id": "fresh-sid-1"},
+        # Future-proof: 2030-01-01 is within the absurdly large grace window.
+        "delay": {"stamp": "2030-01-01T00:00:00+00:00"},
+    })
+    _run(adapter._dispatch_dm(stanza, replay=True))
+    assert len(received) == 1
+
+
+def test_replay_outside_grace_is_dropped():
+    """Stale MAM replays must NOT reach the gateway — restart-time history
+    should never trigger a live reply (or a cross-platform mirror push).
+    """
+    adapter = _make_adapter(mam_replay_grace_seconds=1)
+    received = _capture(adapter)
+    stanza = _FakeStanza({
+        "body": "ancient",
         "from": "me@example.com/x",
         "id": "old-1",
         "stanza_id": {"id": "old-sid-1"},
         "delay": {"stamp": "2000-01-01T00:00:00+00:00"},
     })
     _run(adapter._dispatch_dm(stanza, replay=True))
-    assert len(received) == 1
-    assert received[0].extra.get("silent") is True
+    assert received == []
+
+
+def test_replay_without_timestamp_is_dropped():
+    """An undatable MAM stanza is treated as stale, not as fresh."""
+    adapter = _make_adapter(mam_replay_grace_seconds=300)
+    received = _capture(adapter)
+    stanza = _FakeStanza({
+        "body": "undatable",
+        "from": "me@example.com/x",
+        "id": "nodate-1",
+        "stanza_id": {"id": "nodate-sid-1"},
+    })
+    _run(adapter._dispatch_dm(stanza, replay=True))
+    assert received == []
 
 
 @pytest.mark.parametrize("body", ["", "   ", "\n\n"])
 def test_empty_body_is_dropped(body):
     adapter = _make_adapter()
-    received = []
-
-    async def handler(event):
-        received.append(event)
-
-    adapter.set_message_handler(handler)
+    received = _capture(adapter)
     stanza = _FakeStanza({"body": body, "from": "me@example.com/x", "id": "empty"})
-    asyncio.run(adapter._dispatch_dm(stanza, replay=False))
+    _run(adapter._dispatch_dm(stanza, replay=False))
     assert received == []
-
-
-def test_register_returns_expected_shape():
-    from hermes_plugin_xmpp.adapter import register
-
-    plug = register()
-    for key in (
-        "name", "label", "kind", "factory", "is_configured", "validate",
-        "interactive_setup", "env_enable_hook", "standalone_sender", "platform_hint",
-    ):
-        assert key in plug, f"register() missing key {key}"
-    assert plug["name"] == "xmpp"
-    assert plug["kind"] == "platform"

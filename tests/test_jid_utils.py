@@ -1,9 +1,7 @@
 import pytest
 
 from hermes_plugin_xmpp.jid_utils import (
-    build_session_key,
-    chat_id_for_dm,
-    chat_id_for_muc,
+    bare_jid,
     is_addressed_to_nick,
     normalize_jid_set,
     parse_jid,
@@ -33,28 +31,15 @@ def test_parse_jid_rejects_garbage(bad):
         parse_jid(bad)
 
 
+def test_bare_jid_is_case_folded():
+    # Whether slixmpp is present or not, bare_jid must be lower-case so
+    # allowlist lookups don't depend on how the user typed the JID.
+    assert bare_jid("Me@Example.com/Phone") == "me@example.com"
+
+
 def test_normalize_jid_set_lowercases_and_dedups():
     out = normalize_jid_set(["Alice@Ex.com", "alice@ex.com", "  ", "bob@ex.com"])
     assert out == {"alice@ex.com", "bob@ex.com"}
-
-
-def test_session_key_format():
-    ct, cid = chat_id_for_dm("Me@Example.com/phone")
-    assert ct == "private"
-    assert cid == "me@example.com"
-    assert build_session_key(ct, cid) == "agent:main:xmpp:private:me@example.com"
-
-
-def test_session_key_muc():
-    ct, cid = chat_id_for_muc("team@conference.example.com")
-    assert ct == "group"
-    assert cid == "team@conference.example.com"
-    assert build_session_key(ct, cid) == "agent:main:xmpp:group:team@conference.example.com"
-
-
-def test_build_session_key_rejects_unknown_chat_type():
-    with pytest.raises(ValueError):
-        build_session_key("channel", "x@y")
 
 
 @pytest.mark.parametrize(
@@ -63,6 +48,8 @@ def test_build_session_key_rejects_unknown_chat_type():
         ("bot: hello", True),
         ("Bot, hello", True),
         ("bot hello", True),
+        ("@bot: hello", True),
+        ("@bot hello", True),
         ("not the bot", False),
         ("", False),
         ("botanist: hi", False),  # would-be prefix match is rejected
@@ -76,4 +63,5 @@ def test_strip_nick_prefix_variants():
     assert strip_nick_prefix("bot: hello", "bot") == "hello"
     assert strip_nick_prefix("Bot, hello", "bot") == "hello"
     assert strip_nick_prefix("bot   hello", "bot") == "hello"
+    assert strip_nick_prefix("@bot: hello", "bot") == "hello"
     assert strip_nick_prefix("hello", "bot") == "hello"

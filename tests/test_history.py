@@ -19,14 +19,13 @@ class _FakeNode:
     def __getitem__(self, key):
         val = self._data.get(key)
         if val is None:
-            return _FakeNode({})  # so .get / nested access doesn't blow up
+            return _FakeNode({})
         if isinstance(val, dict):
             return _FakeNode(val)
         return val
 
     def get(self, key, default=None):
-        v = self._data.get(key, default)
-        return v
+        return self._data.get(key, default)
 
     def __contains__(self, key):
         return key in self._data
@@ -51,7 +50,12 @@ def test_dedup_lru_evicts_oldest():
 
 
 def test_stanza_key_prefers_xep_0359():
-    stanza = _FakeNode({"stanza_id": {"id": "xep-id"}, "origin_id": {"id": "oid"}, "from": "x@y", "id": "raw"})
+    stanza = _FakeNode({
+        "stanza_id": {"id": "xep-id"},
+        "origin_id": {"id": "oid"},
+        "from": "x@y",
+        "id": "raw",
+    })
     key = StanzaKey.from_stanza(stanza)
     assert key.value == "sid:xep-id"
 
@@ -93,8 +97,9 @@ def test_replay_should_respond_stale():
     assert replay_should_respond(now - 600, grace_seconds=60, now=now) is False
 
 
-def test_replay_should_respond_no_ts_defaults_fresh():
-    assert replay_should_respond(None, grace_seconds=60) is True
+def test_replay_should_respond_no_ts_is_stale():
+    # Undatable history must not retroactively trigger live replies.
+    assert replay_should_respond(None, grace_seconds=60) is False
 
 
 def test_last_seen_store_roundtrip(tmp_path: Path):
@@ -106,9 +111,19 @@ def test_last_seen_store_roundtrip(tmp_path: Path):
     s2 = LastSeenStore("bot@example.com", path=state)
     assert s2.get() == s1.get()
     assert s2.get(scope="muc:room@conf")["stanza_id"] == "sid-2"
-    # Per-JID isolation:
+
     other = LastSeenStore("other@example.com", path=state)
     assert other.get() == {}
+
+
+def test_last_seen_store_start_iso_only(tmp_path: Path):
+    """The cursor is exposed as ISO-8601, matching slixmpp's MAM ``start=``."""
+    state = tmp_path / "seen.json"
+    s = LastSeenStore("bot@example.com", path=state)
+    s.update(scope=None, stanza_id="sid", ts=1700000000.0)
+    iso = s.get_start_iso()
+    assert isinstance(iso, str)
+    assert iso.startswith("20")  # ISO-8601, no Unix-epoch leakage
 
 
 def test_last_seen_store_handles_corrupt_file(tmp_path: Path):
@@ -116,6 +131,5 @@ def test_last_seen_store_handles_corrupt_file(tmp_path: Path):
     state.write_text("not json", encoding="utf-8")
     s = LastSeenStore("bot@example.com", path=state)
     assert s.get() == {}
-    # And it should overwrite cleanly on next update:
     s.update(scope=None, stanza_id="sid", ts=1.0)
     assert "sid" in state.read_text(encoding="utf-8")

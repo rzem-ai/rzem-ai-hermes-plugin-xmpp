@@ -10,7 +10,7 @@ This module is responsible for:
 - Deduplicating stanzas that arrive twice (carbon + MAM, or MAM
   catch-ups that overlap).
 - Deciding, for each replayed stanza, whether it is still "fresh enough"
-  to trigger a live agent reply, or should be ingested silently.
+  to act on, or should be dropped (history-only).
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class StanzaKey:
             return cls(value=f"oid:{oid}")
         msg_from = str(stanza.get("from", "")) if hasattr(stanza, "get") else ""
         msg_id = str(stanza.get("id", "")) if hasattr(stanza, "get") else ""
-        ts = _safe_delay_ts(stanza) or time.time()
+        ts = stanza_timestamp(stanza) or time.time()
         return cls(value=f"raw:{msg_from}|{msg_id}|{ts}")
 
 
@@ -74,7 +74,8 @@ def _safe_origin_id(stanza: Any) -> str | None:
     return None
 
 
-def _safe_delay_ts(stanza: Any) -> float | None:
+def stanza_timestamp(stanza: Any) -> float | None:
+    """Return the XEP-0203 ``delay`` stamp as a Unix timestamp, or None."""
     try:
         delay = stanza["delay"]
         stamp = delay["stamp"] if delay is not None else None
@@ -114,8 +115,12 @@ class DedupLRU:
 
 class LastSeenStore:
     """Persists the most recent stanza we have processed, keyed by
-    ``bot_jid`` and ``muc:<room_jid>``. The shape is intentionally simple
-    so external tools / users can poke at it."""
+    ``bot_jid`` and ``muc:<room_jid>``.
+
+    Cursors are stored as ISO-8601 strings so slixmpp's XEP-0313 ``start=``
+    parameter accepts them directly. A stanza-id is kept alongside for
+    diagnostic / future range-by-id use.
+    """
 
     def __init__(self, bot_jid: str, path: Path | None = None) -> None:
         self.bot_jid = bot_jid.lower()
@@ -160,13 +165,18 @@ class LastSeenStore:
     def get(self, scope: str | None = None) -> dict[str, Any]:
         return dict(self._data.get(self._slot(scope), {}))
 
+    def get_start_iso(self, scope: str | None = None) -> str | None:
+        """Return the resume cursor as an ISO-8601 string (or None)."""
+        entry = self._data.get(self._slot(scope)) or {}
+        iso = entry.get("ts_iso")
+        return iso if isinstance(iso, str) and iso else None
+
     def update(self, scope: str | None, *, stanza_id: str | None, ts: float | None) -> None:
         slot = self._slot(scope)
         entry = dict(self._data.get(slot, {}))
         if stanza_id:
             entry["stanza_id"] = stanza_id
         if ts is not None:
-            entry["ts"] = ts
             entry["ts_iso"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
         if entry:
             self._data[slot] = entry
@@ -174,24 +184,26 @@ class LastSeenStore:
 
 
 def replay_should_respond(stanza_ts: float | None, *, grace_seconds: int, now: float | None = None) -> bool:
-    """A MAM-replayed stanza triggers a live agent reply only if it is
-    within ``grace_seconds`` of "now". Otherwise it is ingested silently
-    (the gateway still gets a chance to update memory)."""
+    """Return True only when a MAM-replayed stanza is fresh enough to act on.
+
+    A missing timestamp is treated as stale: by definition, anything coming
+    back through MAM is historical, and undatable history must not trigger
+    a live reply on every restart.
+    """
     if stanza_ts is None:
-        # No timestamp: be conservative and treat as fresh so we don't
-        # silently drop in-flight messages.
-        return True
+        return False
     return (now or time.time()) - stanza_ts <= grace_seconds
 
 
 def iter_carbon_payload(stanza: Any) -> tuple[str | None, Any]:
-    """If ``stanza`` is a Message Carbon, return ``("received"|"sent",
-    inner_stanza)``. Otherwise return ``(None, stanza)``.
+    """If ``stanza`` is a Message Carbon, return ``(direction, inner_stanza)``
+    where ``direction`` is ``"received"`` or ``"sent"``. Otherwise return
+    ``(None, stanza)``.
 
-    slixmpp's ElementBase lazily synthesizes substanza accessors, so
+    slixmpp's ElementBase lazily synthesises substanza accessors, so
     ``stanza['carbon_received']`` is truthy even when no carbon element
-    exists. The reliable check is membership (``'carbon_received' in
-    stanza``)."""
+    exists. The reliable check is membership.
+    """
     for kind in ("carbon_received", "carbon_sent"):
         try:
             present = kind in stanza
@@ -210,8 +222,7 @@ def iter_carbon_payload(stanza: Any) -> tuple[str | None, Any]:
 
 def collect_mam_results(results: Iterable[Any]) -> list[Any]:
     """Pull forwarded stanzas out of a MAM iterator. Each ``result`` is
-    expected to expose ``result['mam_result']['forwarded']['stanza']`` per
-    slixmpp's XEP-0313 plugin."""
+    expected to expose ``result['mam_result']['forwarded']['stanza']``."""
     out: list[Any] = []
     for result in results:
         try:

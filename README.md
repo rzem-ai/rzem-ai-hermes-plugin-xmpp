@@ -19,8 +19,11 @@ MUC group rooms.
 - **Message Archive Management (XEP-0313)** — on startup the adapter
   pulls the server-side archive since its last-seen cursor so messages
   sent while the gateway was offline are picked up. Stanzas older than
-  `XMPP_MAM_REPLAY_GRACE_SECONDS` (default 300s) are ingested silently;
-  fresher ones get a live reply.
+  `XMPP_MAM_REPLAY_GRACE_SECONDS` (default 300s) only advance the cursor
+  and are not delivered to the agent — this prevents restart-time
+  history from triggering live replies or, when the gateway is
+  configured to mirror across platforms, from re-firing into the other
+  side. Fresher stanzas are delivered normally.
 - **HTTP File Upload (XEP-0363)** for image / file delivery.
 - **Chat States (XEP-0085)** for typing indicators.
 - **Stanza dedup** keyed by `<stanza-id>` (XEP-0359), `<origin-id>`, or a
@@ -86,17 +89,14 @@ The `ctx` is a `PluginContext` whose `register_platform(...)` method
 takes named keyword args and wires an entry into
 `gateway.platform_registry`.
 
-This repo's top-level `__init__.py` is a thin shim: it calls the inner
-`hermes_plugin_xmpp.adapter.register()` (which returns a descriptor
-dict for forward-compat with other plugin hosts), translates the dict
-into `register_platform()` kwargs, and adds the Hermes-side metadata
-(`required_env`, `allowed_users_env`, `allow_all_env`,
-`cron_deliver_env_var`, `install_hint`, `emoji`) that the inner
-descriptor doesn't surface.
+This repo's top-level `__init__.py` calls `ctx.register_platform(...)`
+directly, pulling the adapter factory, validator, env-enablement hook,
+and standalone sender out of the inner `hermes_plugin_xmpp` package.
+The inner package exposes those callables as ordinary module-level
+attributes — there's no descriptor-dict round-trip.
 
-If you're embedding the adapter in a non-Hermes host, you can keep
-calling `hermes_plugin_xmpp.adapter.register()` directly and consume
-the dict yourself.
+If you're embedding the adapter in a non-Hermes host, import the
+adapter class straight from `hermes_plugin_xmpp.adapter`.
 
 ## Configure
 

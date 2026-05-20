@@ -1,15 +1,16 @@
-"""Out-of-process sender used by Hermes's cron / notification path when the
-long-running gateway is not the process delivering the message.
+"""Out-of-process XMPP sender.
 
-Mirrors the IRC plugin's ``_standalone_send`` pattern: open a short-lived
-slixmpp client, wait for session_start, send one stanza, then disconnect.
+The gateway's cron / notification path uses this when the long-running
+adapter is not the process delivering the message. Signature matches the
+``standalone_sender_fn`` contract documented in
+``gateway.platform_registry.PlatformEntry``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+from typing import Any, Mapping
 
 from .config import XmppConfig, load_config
 from .jid_utils import parse_jid
@@ -20,8 +21,8 @@ _STANDALONE_RESOURCE_SUFFIX = "-cron"
 
 
 def _build_client(cfg: XmppConfig):
-    """Imported lazily so ``import hermes_plugin_xmpp`` does not pull in
-    slixmpp until the gateway actually constructs an adapter."""
+    """Imported lazily so ``import hermes_plugin_xmpp`` doesn't pull in
+    slixmpp until the gateway actually constructs a sender."""
     from slixmpp import ClientXMPP
 
     parsed = parse_jid(cfg.jid)
@@ -33,25 +34,33 @@ def _build_client(cfg: XmppConfig):
     return client
 
 
-async def _send_once(cfg: XmppConfig, recipient: str, body: str, *, mtype: str) -> bool:
+async def _send_once(
+    cfg: XmppConfig, recipient: str, body: str, *, mtype: str
+) -> dict[str, Any]:
     client = _build_client(cfg)
-    done: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+    done: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
+    sent_id_holder: dict[str, str] = {}
 
     def _on_session_start(_event):
         try:
             client.send_presence()
-            client.send_message(mto=recipient, mbody=body, mtype=mtype)
+            msg = client.make_message(mto=recipient, mbody=body, mtype=mtype)
+            msg.send()
+            sent_id_holder["id"] = str(msg.get("id", "")) or ""
+        except Exception as exc:
+            if not done.done():
+                done.set_result({"error": f"send failed: {exc}"})
+            return
         finally:
-            # Give the stanza a moment to flush before we disconnect.
             asyncio.get_event_loop().call_later(0.5, lambda: client.disconnect(wait=True))
 
     def _on_disconnected(_event):
         if not done.done():
-            done.set_result(True)
+            done.set_result({"success": True, "message_id": sent_id_holder.get("id") or None})
 
     def _on_failed_auth(_event):
         if not done.done():
-            done.set_exception(RuntimeError("XMPP auth failed"))
+            done.set_result({"error": "XMPP auth failed"})
 
     client.add_event_handler("session_start", _on_session_start)
     client.add_event_handler("disconnected", _on_disconnected)
@@ -68,20 +77,45 @@ async def _send_once(cfg: XmppConfig, recipient: str, body: str, *, mtype: str) 
             client.disconnect(wait=False)
         except Exception:
             pass
-        return False
+        return {"error": "timed out waiting for XMPP send"}
 
 
-def standalone_send(
-    recipient: str,
-    body: str,
+async def standalone_sender_fn(
+    pconfig: Any,
+    chat_id: str,
+    message: str,
     *,
-    extra: Mapping[str, object] | None = None,
-    is_muc: bool = False,
-) -> bool:
-    """Sync entry point matching the plugin loader's ``standalone_sender``
-    contract. Spins up its own event loop because the cron path is
-    expected to be synchronous."""
-    cfg = load_config(extra)
-    parse_jid(recipient)  # validate
-    mtype = "groupchat" if is_muc else "chat"
-    return asyncio.run(_send_once(cfg, recipient, body, mtype=mtype))
+    thread_id: str | None = None,
+    media_files: Any = None,
+    force_document: bool = False,
+) -> dict[str, Any]:
+    """Async entry point matching :class:`PlatformEntry.standalone_sender_fn`.
+
+    XMPP has no native thread/media-document concept here — those kwargs
+    are accepted for contract compatibility and ignored. ``pconfig`` is
+    the gateway's ``PlatformConfig``; its ``.extra`` (or, in dev, the env)
+    must carry credentials.
+    """
+    del thread_id, media_files, force_document
+    extra: Mapping[str, Any] = getattr(pconfig, "extra", None) or {}
+    try:
+        cfg = load_config(extra)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    try:
+        parse_jid(chat_id)
+    except ValueError as exc:
+        return {"error": f"invalid recipient JID: {exc}"}
+    mtype = "groupchat" if _looks_like_room(cfg, chat_id) else "chat"
+    return await _send_once(cfg, chat_id, message, mtype=mtype)
+
+
+def _looks_like_room(cfg: XmppConfig, chat_id: str) -> bool:
+    target = chat_id.lower()
+    for room in cfg.muc_rooms:
+        try:
+            if parse_jid(room).bare.lower() == target:
+                return True
+        except ValueError:
+            continue
+    return False
