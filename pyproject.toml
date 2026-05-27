@@ -34,18 +34,14 @@ dev = [
 ]
 
 [project.entry-points."hermes.platforms"]
-xmpp = "hermes_plugin_xmpp.adapter:register"
+xmpp = "adapter:adapter_factory"
 
 [project.urls]
-Homepage = "https://github.com/rzem-ai/hermes-plugin-xmpp"
-Repository = "https://github.com/rzem-ai/hermes-plugin-xmpp"
+Homepage = "https://github.com/rzem-ai/rzem-ai-hermes-plugin-xmpp"
+Repository = "https://github.com/rzem-ai/rzem-ai-hermes-plugin-xmpp"
 
-[tool.setuptools.packages.find]
-include = ["hermes_plugin_xmpp*"]
-exclude = ["tests*"]
-
-[tool.setuptools.package-data]
-hermes_plugin_xmpp = ["py.typed"]
+[tool.setuptools]
+py-modules = ["adapter"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
