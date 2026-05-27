@@ -11,7 +11,6 @@ description: >
   (XEP-0313) so messages received while the gateway was offline
   are picked up on the next start.
 author: Nous Research community
-entry_point: hermes_plugin_xmpp.adapter:register
 requires_env:
   - name: XMPP_JID
     description: "Bot Jabber ID (e.g. hermes@chat.rzem.ai)"
