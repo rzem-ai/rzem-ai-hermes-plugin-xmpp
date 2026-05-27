@@ -14,6 +14,7 @@ adapter.
 """
 
 from __future__ import annotations
+from tools.lazy_deps import ensure, FeatureUnavailable
 
 import os
 from typing import Any
@@ -37,6 +38,12 @@ def _validate_config(config: Any) -> bool:
 
 def _check_fn() -> bool:
     """Plugin is "available" when slixmpp is importable."""
+    try:
+        ensure("slixmpp")   # key must be in LAZY_DEPS
+        ensure("aiohttp")   # key must be in LAZY_DEPS
+    except FeatureUnavailable as exc:
+        print("XMPP plugin unavailable: slixmpp library is not installed. Please install it with 'uv pip install --python <hermes-venv>/bin/python slixmpp aiohttp'")
+
     try:
         import slixmpp  # noqa: F401
     except Exception:
