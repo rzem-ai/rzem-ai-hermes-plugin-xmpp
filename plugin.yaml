@@ -1,4 +1,4 @@
-name: xmpp-platform
+name: rzem_ai_xmpp
 label: XMPP
 kind: platform
 version: 0.1.0
@@ -10,7 +10,7 @@ description: >
   with the user's other clients, and Message Archive Management
   (XEP-0313) so messages received while the gateway was offline
   are picked up on the next start.
-author: Nous Research community
+author: rzem-ai
 requires_env:
   - name: XMPP_JID
     description: "Bot Jabber ID (e.g. hermes@chat.rzem.ai)"

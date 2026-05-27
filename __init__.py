@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from adapter import (
+from plugins.rzem_ai_xmpp.adapter import (
     PLATFORM,
     PLATFORM_HINT,
     adapter_factory,
