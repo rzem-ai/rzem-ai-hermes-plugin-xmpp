@@ -18,14 +18,14 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from hermes_plugin_xmpp import (
+from adapter import (
     PLATFORM,
     PLATFORM_HINT,
     adapter_factory,
     interactive_setup,
+    standalone_sender_fn,
     validate,
 )
-from hermes_plugin_xmpp._standalone import standalone_sender_fn
 
 
 def _validate_config(config: Any) -> bool:
