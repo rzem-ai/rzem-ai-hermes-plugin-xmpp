@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("xmpp")
 
 
 # ===========================================================================
@@ -871,6 +871,7 @@ class XmppAdapter(BasePlatformAdapter):
             "xep_0313",
             "xep_0359",
             "xep_0363",
+            "xep_0461",
         ):
             with suppress(Exception):
                 client.register_plugin(plugin)
