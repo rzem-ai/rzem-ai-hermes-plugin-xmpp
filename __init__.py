@@ -18,20 +18,21 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from plugins.rzem_ai_xmpp.adapter import (
-    PLATFORM,
-    PLATFORM_HINT,
-    adapter_factory,
-    interactive_setup,
-    standalone_sender_fn,
-    validate,
-)
+from . import adapter
+
+# PLATFORM,
+#     PLATFORM_HINT,
+#     adapter_factory,
+#     interactive_setup,
+#     standalone_sender_fn,
+#     validate,
+# )
 
 
 def _validate_config(config: Any) -> bool:
     """``validate`` returns an error list; the registry wants a bool."""
     extra = getattr(config, "extra", None) or {}
-    return not validate(extra)
+    return not adapter.validate(extra)
 
 
 def _check_fn() -> bool:
@@ -39,6 +40,7 @@ def _check_fn() -> bool:
     try:
         import slixmpp  # noqa: F401
     except Exception:
+        print("XMPP plugin unavailable: slixmpp library is not installed. Please install it with 'uv pip install --python <hermes-venv>/bin/python slixmpp aiohttp'")
         return False
     return True
 
@@ -102,20 +104,20 @@ def _env_enablement_fn() -> dict | None:
 def register(ctx: Any) -> None:
     """Hermes plugin entry point."""
     ctx.register_platform(
-        name=PLATFORM,
+        name=adapter.PLATFORM,
         label="XMPP",
-        adapter_factory=adapter_factory,
+        adapter_factory=adapter.adapter_factory,
         check_fn=_check_fn,
         validate_config=_validate_config,
         required_env=["XMPP_JID", "XMPP_PASSWORD"],
         install_hint="uv pip install --python <hermes-venv>/bin/python slixmpp aiohttp",
-        setup_fn=interactive_setup,
+        setup_fn=adapter.interactive_setup,
         env_enablement_fn=_env_enablement_fn,
-        standalone_sender_fn=standalone_sender_fn,
+        standalone_sender_fn=adapter.standalone_sender_fn,
         allowed_users_env="XMPP_ALLOWED_JIDS",
         allow_all_env="XMPP_ALLOW_ALL_USERS",
         cron_deliver_env_var="XMPP_HOME_JID",
-        platform_hint=PLATFORM_HINT,
+        platform_hint=adapter.PLATFORM_HINT,
         emoji="💬",
     )
 
