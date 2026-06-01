@@ -24,7 +24,17 @@ MUC group rooms.
   history from triggering live replies or, when the gateway is
   configured to mirror across platforms, from re-firing into the other
   side. Fresher stanzas are delivered normally.
-- **HTTP File Upload (XEP-0363)** for image / file delivery.
+- **File transfer, both directions (XEP-0363 + XEP-0066).** The agent can
+  **send** files — images, documents, audio, video — by uploading them to
+  the server's HTTP-Upload service and sharing the resulting URL as an
+  Out-of-Band (OOB) message, so clients render them inline / offer a
+  download. It can also **receive** files: an inbound OOB / HTTP-Upload
+  share is downloaded into Hermes's media cache and handed to the agent as
+  a real attachment (images → vision, voice notes → speech-to-text,
+  everything else → a saved document) rather than a bare link. Caption
+  text is sent as its own message so strict clients still render the share
+  inline. Scheduled / cron deliveries (`standalone_sender_fn`) can attach
+  files too.
 - **Chat States (XEP-0085)** for typing indicators.
 - **Stanza dedup** keyed by `<stanza-id>` (XEP-0359), `<origin-id>`, or a
   `(from, id, timestamp)` tuple, so carbons + MAM never double-deliver.

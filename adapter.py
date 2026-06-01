@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
@@ -669,24 +670,53 @@ def _build_client(cfg: XmppConfig):
     resource = (parsed.resource or cfg.resource) + _STANDALONE_RESOURCE_SUFFIX
     bot_jid = f"{parsed.bare}/{resource}"
     client = ClientXMPP(bot_jid, cfg.password)
-    client.register_plugin("xep_0030")
-    client.register_plugin("xep_0199")
+    for plugin in ("xep_0030", "xep_0066", "xep_0199", "xep_0363"):
+        with suppress(Exception):
+            client.register_plugin(plugin)
     return client
 
 
 async def _send_once(
-    cfg: XmppConfig, recipient: str, body: str, *, mtype: str
+    cfg: XmppConfig,
+    recipient: str,
+    body: str,
+    *,
+    mtype: str,
+    media_files: Any = None,
 ) -> dict[str, Any]:
     client = _build_client(cfg)
     done: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
     sent_id_holder: dict[str, str] = {}
 
-    def _on_session_start(_event):
+    # Normalize media_files into a list of paths. Hermes passes
+    # ``[(path, is_voice), ...]``; tolerate bare strings too.
+    media_paths: list[str] = []
+    for item in media_files or []:
+        path = item[0] if isinstance(item, (tuple, list)) and item else item
+        if isinstance(path, str) and path:
+            media_paths.append(path)
+
+    async def _on_session_start(_event):
         try:
             client.send_presence()
-            msg = client.make_message(mto=recipient, mbody=body, mtype=mtype)
-            msg.send()
-            sent_id_holder["id"] = str(msg.get("id", "")) or ""
+            if body.strip():
+                msg = client.make_message(mto=recipient, mbody=body, mtype=mtype)
+                msg.send()
+                sent_id_holder["id"] = str(msg.get("id", "")) or ""
+            for path in media_paths:
+                if not os.path.isfile(path):
+                    log.warning("XMPP standalone: media not found: %s", path)
+                    continue
+                try:
+                    url = await client["xep_0363"].upload_file(path)
+                except Exception as exc:
+                    log.warning("XMPP standalone: upload failed for %s: %s", path, exc)
+                    continue
+                fmsg = client.make_message(mto=recipient, mbody=str(url), mtype=mtype)
+                with suppress(Exception):
+                    fmsg["oob"]["url"] = str(url)
+                fmsg.send()
+                sent_id_holder["id"] = str(fmsg.get("id", "")) or sent_id_holder.get("id", "")
         except Exception as exc:
             if not done.done():
                 done.set_result({"error": f"send failed: {exc}"})
@@ -742,10 +772,12 @@ async def standalone_sender_fn(
 ) -> dict[str, Any]:
     """Async entry point matching ``PlatformEntry.standalone_sender_fn``.
 
-    XMPP has no native thread/media-document concept here — those kwargs
-    are accepted for contract compatibility and ignored.
+    XMPP has no native thread concept here, so ``thread_id`` /
+    ``force_document`` are accepted for contract compatibility and ignored.
+    ``media_files`` are uploaded via HTTP Upload (XEP-0363) and shared as OOB
+    attachments so scheduled / cron deliveries can include files.
     """
-    del thread_id, media_files, force_document
+    del thread_id, force_document
     extra: Mapping[str, Any] = getattr(pconfig, "extra", None) or {}
     try:
         cfg = load_config(extra)
@@ -756,7 +788,7 @@ async def standalone_sender_fn(
     except ValueError as exc:
         return {"error": f"invalid recipient JID: {exc}"}
     mtype = "groupchat" if _standalone_looks_like_room(cfg, chat_id) else "chat"
-    return await _send_once(cfg, chat_id, message, mtype=mtype)
+    return await _send_once(cfg, chat_id, message, mtype=mtype, media_files=media_files)
 
 
 # ===========================================================================
@@ -825,6 +857,43 @@ def _chunk(text: str, limit: int = _CHUNK_BYTES) -> list[str]:
 
 
 _BACKOFF_SCHEDULE = (2, 4, 8, 16, 32)
+
+
+# ---------------------------------------------------------------------------
+# OOB / HTTP-Upload (XEP-0066 + XEP-0363) media classification
+#
+# Inbound file shares arrive as a message whose body is an HTTP(S) URL plus a
+# matching ``<x xmlns='jabber:x:oob'><url/></x>`` element. We classify by
+# extension so the gateway routes the download to the right cache + pipeline
+# (images → vision, voice notes → STT, everything else → document).
+# ---------------------------------------------------------------------------
+
+_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
+_VOICE_EXTS = frozenset({".ogg", ".oga", ".opus"})
+_AUDIO_EXTS = frozenset({".mp3", ".m4a", ".wav", ".flac", ".aac"})
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"})
+
+
+def _url_filename(url: str) -> str:
+    """Best-effort human filename from a URL path (percent-decoded)."""
+    from urllib.parse import unquote, urlsplit
+
+    name = os.path.basename(urlsplit(url).path)
+    return unquote(name) if name else "file"
+
+
+def _media_kind(name: str) -> str:
+    """Classify a filename / URL into image|voice|audio|video|document."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in _IMAGE_EXTS:
+        return "image"
+    if ext in _VOICE_EXTS:
+        return "voice"
+    if ext in _AUDIO_EXTS:
+        return "audio"
+    if ext in _VIDEO_EXTS:
+        return "video"
+    return "document"
 
 
 class XmppAdapter(BasePlatformAdapter):
@@ -1002,46 +1071,261 @@ class XmppAdapter(BasePlatformAdapter):
             msg.send()
         self._typing_chats.discard(chat_id)
 
-    async def send_image_file(
+    # -- outbound files (XEP-0363 HTTP Upload + XEP-0066 OOB) ----------------
+    #
+    # The gateway dispatches agent-produced attachments through one of these
+    # typed entry points (send_image_file / send_document / send_video /
+    # send_voice for local paths, send_image for remote URLs). Each local file
+    # is uploaded to the server's HTTP-Upload service and the resulting URL is
+    # shared as an OOB message so XMPP clients render it inline / offer a
+    # download. A remote URL (send_image) is OOB-shared directly without a
+    # re-upload.
+
+    async def _upload(self, path: str) -> tuple[str | None, str | None]:
+        """Upload ``path`` to the HTTP-Upload service. Returns (url, error)."""
+        client = self._client
+        if client is None:
+            return None, "XMPP client not connected"
+        if not os.path.isfile(path):
+            return None, f"file not found: {path}"
+        try:
+            url = await client["xep_0363"].upload_file(path)
+            return str(url), None
+        except Exception as exc:
+            log.warning("XMPP plugin: HTTP upload failed for %s: %s", os.path.basename(path), exc)
+            return None, f"HTTP upload failed: {exc}"
+
+    async def _send_oob(
         self,
         chat_id: str,
-        path: str,
-        caption: str | None = None,
-        metadata: Mapping[str, Any] | None = None,
+        url: str,
+        caption: str | None,
+        reply_to: str | None,
+        metadata: Mapping[str, Any] | None,
     ) -> SendResult:
+        """Share ``url`` as an OOB attachment, with an optional caption.
+
+        The caption is sent as its own message *before* the URL: many clients
+        (Conversations, Dino) only render a share inline when the message body
+        is exactly the URL, so we never fold the two together.
+        """
         client = self._client
         if client is None:
             return SendResult(success=False, error="XMPP client not connected", retryable=True)
-        if not os.path.isfile(path):
-            return SendResult(success=False, error=f"image file not found: {path}")
-
-        url: str | None = None
-        try:
-            url = await client["xep_0363"].upload_file(path)
-        except Exception as exc:
-            log.warning("XMPP plugin: HTTP upload failed (%s); sending caption only", exc)
 
         is_muc = bool(metadata and metadata.get("is_muc")) or self._looks_like_muc(chat_id)
         mtype = "groupchat" if is_muc else "chat"
-
-        body_parts: list[str] = []
-        if caption:
-            body_parts.append(caption)
-        if url:
-            body_parts.append(url)
-        body = "\n".join(body_parts) if body_parts else (url or "")
-        if not body:
-            return SendResult(success=False, error="nothing to send")
+        message_ids: list[str] = []
 
         try:
-            msg = client.make_message(mto=chat_id, mbody=body, mtype=mtype)
-            if url:
-                with suppress(Exception):
-                    msg["oob"]["url"] = url
+            cap = _strip_markdown(caption or "").strip()
+            if cap:
+                cmsg = client.make_message(mto=chat_id, mbody=cap, mtype=mtype)
+                if reply_to:
+                    with suppress(Exception):
+                        cmsg["reply"]["id"] = reply_to
+                        cmsg["reply"]["to"] = chat_id
+                cmsg.send()
+                cid = str(cmsg.get("id", "")) or ""
+                if cid:
+                    message_ids.append(cid)
+
+            msg = client.make_message(mto=chat_id, mbody=url, mtype=mtype)
+            with suppress(Exception):
+                msg["oob"]["url"] = url
             msg.send()
-            return SendResult(success=True, message_id=str(msg.get("id", "")) or None)
+            mid = str(msg.get("id", "")) or ""
+            if mid:
+                message_ids.append(mid)
         except Exception as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
+
+        last = message_ids[-1] if message_ids else None
+        return SendResult(success=True, message_id=last, continuation_message_ids=tuple(message_ids[:-1]))
+
+    async def _share_local_file(
+        self,
+        chat_id: str,
+        path: str,
+        caption: str | None,
+        reply_to: str | None,
+        metadata: Mapping[str, Any] | None,
+    ) -> SendResult:
+        url, error = await self._upload(path)
+        if not url:
+            return SendResult(success=False, error=error, retryable=False)
+        return await self._send_oob(chat_id, url, caption, reply_to, metadata)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        return await self._share_local_file(chat_id, image_path, caption, reply_to, metadata)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        return await self._share_local_file(chat_id, file_path, caption, reply_to, metadata)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        return await self._share_local_file(chat_id, video_path, caption, reply_to, metadata)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        return await self._share_local_file(chat_id, audio_path, caption, reply_to, metadata)
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> SendResult:
+        """Share an already-hosted image URL (no re-upload)."""
+        client = self._client
+        if client is None:
+            return SendResult(success=False, error="XMPP client not connected", retryable=True)
+        if not image_url:
+            return SendResult(success=False, error="no image URL")
+        return await self._send_oob(chat_id, image_url, caption, reply_to, metadata)
+
+    # -- inbound files (XEP-0066 OOB / XEP-0363 shares) ----------------------
+
+    @staticmethod
+    def _extract_oob_url(stanza: Any) -> str | None:
+        """Return the ``<x xmlns='jabber:x:oob'><url/>`` value, if present."""
+        try:
+            url = stanza["oob"]["url"]
+        except Exception:
+            return None
+        url = str(url or "").strip()
+        return url or None
+
+    @staticmethod
+    def _body_is_url(text: str | None) -> str | None:
+        """If the whole body is a single HTTP(S) URL, return it (OOB fallback).
+
+        Some clients share via HTTP Upload without an explicit OOB element —
+        the body is just the URL. Treat that as an attachment too.
+        """
+        token = (text or "").strip()
+        if not token or any(c.isspace() for c in token):
+            return None
+        if token.startswith(("http://", "https://")):
+            return token
+        return None
+
+    async def _download_bytes(self, url: str) -> bytes | None:
+        """Fetch raw bytes for media types without a from-URL cache helper."""
+        with suppress(Exception):
+            from tools.url_safety import is_safe_url  # type: ignore
+
+            if not is_safe_url(url):
+                log.warning("XMPP plugin: refusing to fetch unsafe media URL")
+                return None
+        try:
+            import aiohttp
+        except Exception:
+            return None
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    return await resp.read()
+        except Exception as exc:
+            log.warning("XMPP plugin: media download failed: %s", exc)
+            return None
+
+    async def _download_oob(self, url: str):
+        """Download an inbound share into the Hermes media cache.
+
+        Returns ``(local_path, mime, message_type)`` or ``(None, None, None)``
+        when the download fails or the gateway media cache is unavailable
+        (e.g. unit-test mode without the real ``gateway`` package installed).
+        """
+        if not USING_REAL_GATEWAY:
+            return None, None, None
+        name = _url_filename(url)
+        kind = _media_kind(name)
+        ext = os.path.splitext(name)[1].lower()
+        mime = mimetypes.guess_type(name)[0]
+        try:
+            if kind == "image":
+                from gateway.platforms.base import cache_image_from_url
+
+                path = await cache_image_from_url(url, ext or ".jpg")
+                return path, mime or "image/jpeg", MessageType.PHOTO
+            if kind in ("voice", "audio"):
+                from gateway.platforms.base import cache_audio_from_url
+
+                path = await cache_audio_from_url(url, ext or ".ogg")
+                mtype = MessageType.VOICE if kind == "voice" else MessageType.AUDIO
+                return path, mime or "audio/ogg", mtype
+            data = await self._download_bytes(url)
+            if data is None:
+                return None, None, None
+            if kind == "video":
+                from gateway.platforms.base import cache_video_from_bytes
+
+                path = cache_video_from_bytes(data, ext or ".mp4")
+                return path, mime or "video/mp4", MessageType.VIDEO
+            from gateway.platforms.base import cache_document_from_bytes
+
+            path = cache_document_from_bytes(data, name)
+            return path, mime or "application/octet-stream", MessageType.DOCUMENT
+        except Exception as exc:
+            log.warning("XMPP plugin: failed to ingest incoming media %s: %s", name, exc)
+            return None, None, None
+
+    async def _resolve_media(
+        self, stanza: Any, body: str
+    ) -> tuple[str, list[str], list[str], Any]:
+        """Resolve an inbound OOB/HTTP-Upload share to cached media.
+
+        Returns ``(text, media_urls, media_types, message_type)``. When there
+        is no attachment — or the download fails — the original body is left
+        intact as text and ``message_type`` is ``TEXT``.
+        """
+        url = self._extract_oob_url(stanza) or self._body_is_url(body)
+        if not url:
+            return body, [], [], MessageType.TEXT
+        path, mime, mtype = await self._download_oob(url)
+        if not path:
+            return body, [], [], MessageType.TEXT
+        # If the body was just the URL, drop it so the agent doesn't also see a
+        # raw link next to the attachment. A real caption is preserved.
+        text = "" if body.strip() == url else body
+        return text, [path], [mime or "application/octet-stream"], mtype
 
     async def _on_session_start(self, _event: Any) -> None:
         client = self._client
@@ -1117,8 +1401,10 @@ class XmppAdapter(BasePlatformAdapter):
 
     async def _dispatch_dm(self, stanza: Any, *, replay: bool) -> None:
         body = self._extract_body(stanza)
-        if body is None:
+        has_oob = self._extract_oob_url(stanza) is not None
+        if body is None and not has_oob:
             return
+        body = body or ""
         from_jid = self._extract_from(stanza)
         if not from_jid:
             return
@@ -1141,6 +1427,7 @@ class XmppAdapter(BasePlatformAdapter):
             return
 
         raw_id = self._extract_id(stanza)
+        text, media_urls, media_types, message_type = await self._resolve_media(stanza, body)
         source = self.build_source(
             chat_id=sender_bare,
             chat_name=sender_bare,
@@ -1150,11 +1437,13 @@ class XmppAdapter(BasePlatformAdapter):
             message_id=raw_id or None,
         )
         event = MessageEvent(
-            text=body,
-            message_type=MessageType.TEXT,
+            text=text,
+            message_type=message_type,
             source=source,
             raw_message=stanza,
             message_id=raw_id or None,
+            media_urls=media_urls,
+            media_types=media_types,
             timestamp=self._event_timestamp(stanza),
         )
 
@@ -1188,6 +1477,7 @@ class XmppAdapter(BasePlatformAdapter):
             return
 
         text = strip_nick_prefix(body, self.cfg.muc_nickname) if addressed else body
+        text, media_urls, media_types, message_type = await self._resolve_media(stanza, text)
         raw_id = self._extract_id(stanza)
         source = self.build_source(
             chat_id=room_jid.lower(),
@@ -1199,10 +1489,12 @@ class XmppAdapter(BasePlatformAdapter):
         )
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=source,
             raw_message=stanza,
             message_id=raw_id or None,
+            media_urls=media_urls,
+            media_types=media_types,
             timestamp=self._event_timestamp(stanza),
         )
 
